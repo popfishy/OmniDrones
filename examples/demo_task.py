@@ -1,3 +1,6 @@
+import ctypes
+ctypes.CDLL("libX11.so.6").XInitThreads()
+
 import os
 
 import hydra

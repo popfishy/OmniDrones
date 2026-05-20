@@ -1,24 +1,7 @@
-# MIT License
-#
-# Copyright (c) 2023 Botian Xu, Tsinghua University
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
+# 维度适配：核心解决 “多环境仿真” 下张量维度的结构化问题，避免上层处理扁平张量的繁琐；
+# 接口封装：将底层物理引擎的零散接口（位姿、速度、质量、接触力）统一封装，对外提供简洁的、带环境索引的读写方法；
+# 状态兼容：兼容仿真 “运行 / 停止” 两种状态的属性读写逻辑（尤其是质量这类既存在于物理引擎又存在于 USD 文件的属性）；
+# 无人机场景优化：接触力、质心、惯性等接口都是无人机仿真的核心需求（如碰撞检测、动力学建模），针对性做了结构化处理。
 
 
 import torch
@@ -49,7 +32,7 @@ def require_sim_initialized(func):
 
     return _func
 
-
+# 关节型刚体（如无人机、机械臂）
 class ArticulationView(_ArticulationView):
     def __init__(
         self,
@@ -122,7 +105,8 @@ class ArticulationView(_ArticulationView):
                         shape=[self.count, self.num_dof], dtype="float32", device=self._device
                     )
         return
-
+    
+    # 关节刚度/阻尼
     def get_gains(
         self,
         indices: Optional[Union[np.ndarray, List, torch.Tensor]] = None,
@@ -243,8 +227,9 @@ class ArticulationView(_ArticulationView):
             carb.log_warn("Physics Simulation View is not created yet in order to use get_applied_actions")
             return None
 
+    # TODO:@yjq 修改api调用方法，修复传入的usd参数不匹配的问题。  **kwargs
     def get_world_poses(
-        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True
+        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True, **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         indices = self._resolve_env_indices(env_indices)
         if self._physics_view is not None:
@@ -410,7 +395,7 @@ class ArticulationView(_ArticulationView):
         self.shape = self._all_indices.reshape(self.shape).squeeze(dim).shape
         return self
 
-
+# 非关节型刚性体（如无人机底座、负载）
 class RigidPrimView(_RigidPrimView):
     def __init__(
         self,
@@ -430,7 +415,7 @@ class RigidPrimView(_RigidPrimView):
         prepare_contact_sensors: bool = True,
         disable_stablization: bool = True,
         contact_filter_prim_paths_expr: Optional[List[str]] = (),
-        shape: Tuple[int, ...] = (-1,),
+        shape: Tuple[int, ...] = (-1,), 
     ) -> None:
         self.shape = shape
         super().__init__(
@@ -458,8 +443,9 @@ class RigidPrimView(_RigidPrimView):
         self.shape = torch.arange(self.count).reshape(self.shape).shape
         return self
 
+    # TODO:@yjq 修改api调用方法，修复传入的usd参数不匹配的问题。 **kwargs
     def get_world_poses(
-        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True
+        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True, **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         indices = self._resolve_env_indices(env_indices)
         pos, rot = super().get_world_poses(indices, clone)
@@ -518,11 +504,13 @@ class RigidPrimView(_RigidPrimView):
         clone: bool = True
     ) -> torch.Tensor:
         indices = self._resolve_env_indices(env_indices)
+        # 仿真运行时：从物理引擎实时读取质量
         if not omni.timeline.get_timeline_interface().is_stopped() and self._physics_view is not None:
             current_values = self._backend_utils.move_data(self._physics_view.get_masses(), self._device)
             masses = current_values[indices]
             if clone:
                 masses = self._backend_utils.clone_tensor(masses, device=self._device)
+        # 仿真停止时：从USD文件的MassAPI读取（如果没有则自动应用MassAPI）
         else:
             masses = self._backend_utils.create_zeros_tensor([indices.shape[0]], dtype="float32", device=self._device)
             write_idx = 0

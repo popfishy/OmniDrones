@@ -100,25 +100,29 @@ class TransportTrack(IsaacEnv):
         super().__init__(cfg, headless)
 
         self.group.initialize()
-        self.payload = self.group.payload_view
+        self.payload = self.group.payload_view  # RigidPrimView，用于读取载荷状态
 
         self.init_velocities = torch.zeros_like(self.group.get_velocities())
         self.init_joint_pos = self.group.get_joint_positions(clone=True)
         self.init_joint_vel = torch.zeros_like(self.group.get_joint_velocities())
 
+        # 载荷目标姿态分布（roll/pitch 限制小，yaw 随机）
         self.payload_target_rpy_dist = D.Uniform(
             torch.tensor([0., 0., 0.], device=self.device) * torch.pi,
             torch.tensor([0., 0., 2.], device=self.device) * torch.pi
         )
+        # 载荷质量分布：相对于单机质量的倍数（0.5~0.8倍）
         payload_mass_scale = self.cfg.task.payload_mass_scale
         self.payload_mass_dist = D.Uniform(
             torch.as_tensor(payload_mass_scale[0] * self.drone.MASS_0.sum(), device=self.device),
             torch.as_tensor(payload_mass_scale[1] * self.drone.MASS_0.sum(), device=self.device)
         )
+        # 初始平台姿态分布（roll/pitch ±0.2π，yaw 任意）
         self.init_rpy_dist = D.Uniform(
             torch.tensor([0., 0., 0.], device=self.device) * torch.pi,
             torch.tensor([0., 0., 2.], device=self.device) * torch.pi
         )
+        # 轨迹参数分布（用于每次 reset 时采样不同轨迹）
         self.traj_rpy_dist = D.Uniform(
             torch.tensor([0., 0., 0.], device=self.device) * torch.pi,
             torch.tensor([0., 0., 2.], device=self.device) * torch.pi
@@ -148,11 +152,13 @@ class TransportTrack(IsaacEnv):
         self.draw = _debug_draw.acquire_debug_draw_interface()
 
     def _design_scene(self):
+        # 1. 创建无人机模型和位置控制器
         drone_model_cfg = self.cfg.task.drone_model
         self.drone, self.controller = MultirotorBase.make(
             drone_model_cfg.name, drone_model_cfg.controller
         )
 
+        # 2. 创建 TransportationGroup（多机+载荷+连杆的组合结构）
         group_cfg = TransportationCfg(num_drones=self.cfg.task.num_drones)
         self.group = TransportationGroup(drone=self.drone, cfg=group_cfg)
 
@@ -162,8 +168,8 @@ class TransportTrack(IsaacEnv):
         return ["/World/defaultGroundPlane"]
 
     def _set_specs(self):
-        drone_state_dim = self.drone.state_spec.shape[-1] + self.drone.n
-        payload_state_dim = 19 + (self.future_traj_steps-1) * 3
+        drone_state_dim = self.drone.state_spec.shape[-1] + self.drone.n  # 状态维 + one-hot identity
+        payload_state_dim = 19 + (self.future_traj_steps-1) * 3  
         if self.time_encoding:
             self.time_encoding_dim = 4
             payload_state_dim += self.time_encoding_dim
@@ -174,27 +180,35 @@ class TransportTrack(IsaacEnv):
             "obs_payload": UnboundedContinuousTensorSpec((1, payload_state_dim)),
         }).to(self.device)
 
+        # --- 中心化观测 spec（全状态，用于 critic网络）---
         observation_central_spec = CompositeSpec({
             "state_drones": UnboundedContinuousTensorSpec((self.drone.n, drone_state_dim)),
             "state_payload": UnboundedContinuousTensorSpec((1, payload_state_dim))
         }).to(self.device)
 
+        # --- 组装成批量 env 维度 ---
         self.observation_spec = CompositeSpec({
             "agents": {
                 "observation": observation_spec.expand(self.drone.n),
                 "observation_central": observation_central_spec,
             }
         }).expand(self.num_envs).to(self.device)
+
+        # --- 动作 spec（4个无人机的位置控制）---
         self.action_spec = CompositeSpec({
             "agents": {
                 "action": torch.stack([self.drone.action_spec] * self.drone.n, dim=0),
             }
         }).expand(self.num_envs).to(self.device)
+
+        # --- 奖励 spec ---
         self.reward_spec = CompositeSpec({
             "agents": {
                 "reward": UnboundedContinuousTensorSpec((self.drone.n, 1))
             }
         }).expand(self.num_envs).to(self.device)
+
+        # --- 绑定 agent spec（定义 obs/action/reward 的键路径）---
         self.agent_spec["drone"] = AgentSpec(
             "drone", self.drone.n,
             observation_key=("agents", "observation"),

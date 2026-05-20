@@ -1,3 +1,6 @@
+import ctypes
+ctypes.CDLL("libX11.so.6").XInitThreads()
+
 import logging
 import os
 import time
@@ -7,7 +10,7 @@ import torch
 import numpy as np
 import pandas as pd
 import wandb
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
 from torch.func import vmap
 from tqdm import tqdm
@@ -34,9 +37,11 @@ from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
 
 @hydra.main(version_base=None, config_path=".", config_name="train")
 def main(cfg):
+    # 解析Hydra配置（支持命令行覆盖，如algo=ppo）
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+    # 初始化Isaac Sim仿真进程（必须先启动，否则环境无法加载）
     simulation_app = init_simulation_app(cfg)
     run = init_wandb(cfg)
     setproctitle(run.name)
@@ -47,10 +52,10 @@ def main(cfg):
     env_class = IsaacEnv.REGISTRY[cfg.task.name]
     base_env = env_class(cfg, headless=cfg.headless)
 
+    # 环境变换（TorchRL封装，支持观测展平、动作离散化）
     transforms = [InitTracker()]
 
-    # a CompositeSpec is by default processed by a entity-based encoder
-    # ravel it to use a MLP encoder instead
+    # 展平观测（CompositeSpec → 一维Tensor，适配MLP编码器）
     if cfg.task.get("ravel_obs", False):
         transform = ravel_composite(base_env.observation_spec, ("agents", "observation"))
         transforms.append(transform)
@@ -59,6 +64,7 @@ def main(cfg):
         transforms.append(transform)
 
     # optionally discretize the action space or use a controller
+    # 动作离散化（如multidiscrete:5 → 动作空间分为5个离散区间）
     action_transform: str = cfg.task.get("action_transform", None)
     if action_transform is not None:
         if action_transform.startswith("multidiscrete"):
@@ -76,27 +82,31 @@ def main(cfg):
     env.set_seed(cfg.seed)
 
     try:
+        # 从算法注册表加载策略（如ppo→PPOPolicy，mappo→MAPPOPolicy）
         policy = ALGOS[cfg.algo.name.lower()](
             cfg.algo,
-            env.observation_spec,
-            env.action_spec,
-            env.reward_spec,
-            device=base_env.device
+            env.observation_spec,  # 观测空间规格
+            env.action_spec,       # 动作空间规格
+            env.reward_spec,       # 奖励空间规格
+            device=base_env.device  # 设备（默认cuda）
         )
     except KeyError:
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
 
+    # 批次配置（环境数 × 训练间隔 = 每个批次的帧数）
     frames_per_batch = env.num_envs * int(cfg.algo.train_every)
     total_frames = cfg.get("total_frames", -1) // frames_per_batch * frames_per_batch
     max_iters = cfg.get("max_iters", -1)
-    eval_interval = cfg.get("eval_interval", -1)
-    save_interval = cfg.get("save_interval", -1)
+    eval_interval = cfg.get("eval_interval", -1) # 评估间隔（每N批次评估一次）
+    save_interval = cfg.get("save_interval", -1) # 模型保存间隔
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
         if isinstance(k, tuple) and k[0]=="stats"
     ]
     episode_stats = EpisodeStats(stats_keys)
+
+    # 数据收集器（TorchRL同步收集，按批次获取环境交互数据）
     collector = SyncDataCollector(
         env,
         policy=policy,
@@ -112,8 +122,8 @@ def main(cfg):
         exploration_type: ExplorationType=ExplorationType.MODE
     ):
 
-        base_env.enable_render(True)
-        base_env.eval()
+        base_env.enable_render(True) # 启用渲染（生成视频）
+        base_env.eval() 
         env.eval()
         env.set_seed(seed)
 
@@ -163,9 +173,11 @@ def main(cfg):
 
         return info
 
+    # 训练循环（进度条可视化）
     pbar = tqdm(collector, total=total_frames//frames_per_batch)
     env.train()
     for i, data in enumerate(pbar):
+        # 1. 收集训练指标（奖励、episode长度等）
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
         episode_stats.add(data.to_tensordict())
 
@@ -176,14 +188,17 @@ def main(cfg):
             }
             info.update(stats)
 
+        # 2. 执行算法训练（如PPO的clip更新）
         info.update(policy.train_op(data.to_tensordict()))
 
+        # 3. 评估（生成视频，上传到WandB）
         if eval_interval > 0 and i % eval_interval == 0:
             logging.info(f"Eval at {collector._frames} steps.")
             info.update(evaluate())
             env.train()
             base_env.train()
 
+        # 4. 保存模型
         if save_interval > 0 and i % save_interval == 0:
             try:
                 ckpt_path = os.path.join(run.dir, f"checkpoint_{collector._frames}.pt")
@@ -192,6 +207,7 @@ def main(cfg):
             except AttributeError:
                 logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
+        # 5. 日志写入WandB
         run.log(info)
         print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
 

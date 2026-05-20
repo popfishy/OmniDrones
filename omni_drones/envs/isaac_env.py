@@ -79,6 +79,7 @@ class IsaacEnv(EnvBase):
     env_ns = "/World/envs"
     template_env_ns = "/World/envs/env_0"
 
+    # 所有子类在定义时就会自动注册
     REGISTRY: Dict[str, Type["IsaacEnv"]] = {}
 
     def __init__(self, cfg, headless):
@@ -91,7 +92,7 @@ class IsaacEnv(EnvBase):
         self.enable_viewport = True
         # extract commonly used parameters
         self.num_envs = self.cfg.env.num_envs
-        self.max_episode_length = self.cfg.env.max_episode_length
+        self.max_episode_length = self.cfg.env.max_episode_length   # 从 cfg 读取，默认 500
         self.substeps = self.cfg.sim.substeps
 
         torch.backends.cudnn.benchmark = True
@@ -124,7 +125,7 @@ class IsaacEnv(EnvBase):
         # add flag for checking closing status
         self._is_closed = False
         # set camera view
-        # create cloner for duplicating the scenes
+        # 先在 env_0 模板中构建一个完整场景，然后自动克隆 N 份。所有后续操作都以 envs_prim_paths 为索引
         cloner = GridCloner(spacing=self.cfg.env.env_spacing)
         cloner.define_base_env("/World/envs")
         # create the xform prim to hold the template environment
@@ -161,6 +162,7 @@ class IsaacEnv(EnvBase):
 
         # filter collisions within each environment instance
         physics_scene_path = self.sim.get_physics_context().prim_path
+        # 过滤不同环境实例之间的碰撞（防止跨env碰撞）
         cloner.filter_collisions(
             physics_scene_path,
             "/World/collisions",
@@ -210,7 +212,7 @@ class IsaacEnv(EnvBase):
         )
 
     @abc.abstractmethod
-    def _set_specs(self):
+    def _set_specs(self): # 定义 observation_spec, action_spec, reward_spec, agent_spec
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -258,7 +260,7 @@ class IsaacEnv(EnvBase):
         return tensordict
 
     @abc.abstractmethod
-    def _reset_idx(self, env_ids: torch.Tensor):
+    def _reset_idx(self, env_ids: torch.Tensor):  # 根据 env_ids 重置这些环境的初始状态（位置、速度、目标等）
         raise NotImplementedError
 
     def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
@@ -351,7 +353,7 @@ class IsaacEnv(EnvBase):
         else:
             return pos + self.envs_positions, rot
 
-    def enable_render(self, enable: Union[bool, Callable]=True):
+    def enable_render(self, enable: Union[bool, Callable]=True):  # 渲染开关
         if isinstance(enable, bool):
             self._should_render = lambda substep: enable
         elif callable(enable):
@@ -371,6 +373,13 @@ class IsaacEnv(EnvBase):
                 )
             # obtain the rgb data
             rgb_data = self._rgb_annotator.get_data()
+
+            # TODO:Add by yjq
+            # 防崩补丁：如果拿到的数据不是 3D 图像矩阵，就返回一张黑图
+            # if getattr(rgb_data, "ndim", 0) != 3:
+            #     import numpy as np
+            #     return np.zeros((720, 960, 3), dtype=np.uint8)
+
             # convert to numpy array
             rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(*rgb_data.shape)
             # return the rgb data
