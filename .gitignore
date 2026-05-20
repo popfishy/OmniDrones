@@ -139,14 +139,27 @@ videos/
 
 # collected data
 *.pt
+artifacts/
 urdf/
 *.pkl
 *.pth
 tmp
 plot/
 
+# training results
+scripts/results_video/
+
+# media
+*.mp4
+*.pdf
+
+# thumbnails
+.thumbs/
+
+# export logs
+export.log
+
 test*.ipynb
-examples/*.mp4
 *.sh
 
 # sphinx docs output

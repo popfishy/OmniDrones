@@ -1,0 +1,43 @@
+name: differential_uav
+inertia:
+  xx: 0.01027506
+  xy: 0.0
+  xz: 0.0
+  yy: 0.01108973
+  yz: 0.0
+  zz: 0.01654349
+mass: 1.8
+l: 0.157
+drag_coef: 0.2
+rotor_configuration:
+  arm_lengths:
+    - 0.157
+    - 0.157
+    - 0.157
+    - 0.157
+  directions:
+    - 1.0
+    - -1.0
+    - 1.0
+    - -1.0
+  force_constants:
+    - 2.0e-05
+    - 2.0e-05
+    - 2.0e-05
+    - 2.0e-05
+  max_rotation_velocities:
+    - 838
+    - 838
+    - 838
+    - 838
+  moment_constants:
+    - 0.016
+    - 0.016
+    - 0.016
+    - 0.016
+  num_rotors: 4
+  rotor_angles:
+    - 0.88
+    - 2.26
+    - -2.26
+    - -0.88

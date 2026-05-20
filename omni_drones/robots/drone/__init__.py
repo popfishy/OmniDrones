@@ -23,6 +23,7 @@
 
 from .multirotor import MultirotorBase
 
+from .differential_uav import DifferentialUAV
 from .crazyflie import Crazyflie
 from .firefly import Firefly
 from .hummingbird import Hummingbird
