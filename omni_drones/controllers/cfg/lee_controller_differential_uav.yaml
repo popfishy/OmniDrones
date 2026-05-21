@@ -1,5 +1,6 @@
-# Lee position controller parameters
+# Lee position controller parameters (tuned for DifferentialUAV)
+# I_xx=0.010, I_yy=0.011, I_zz=0.017, mass=1.8
 position_gain: [6, 6, 6]
 velocity_gain: [4.7, 4.7, 4.7]
-attitude_gain: [3, 3, 0.15]
-angular_rate_gain: [0.52, 0.52, 0.18]
+attitude_gain: [1.0, 1.0, 0.05]
+angular_rate_gain: [0.18, 0.18, 0.06]
