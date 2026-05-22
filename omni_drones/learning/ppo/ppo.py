@@ -33,6 +33,7 @@ from tensordict import TensorDict
 from tensordict.nn import TensorDictModuleBase, TensorDictModule, TensorDictSequential
 
 from hydra.core.config_store import ConfigStore
+from omegaconf import OmegaConf
 from dataclasses import dataclass
 from typing import Union
 import einops
@@ -95,8 +96,8 @@ class PPOPolicy(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
 
-        self.entropy_coef = 0.001
-        self.clip_param = 0.1
+        self.entropy_coef = OmegaConf.select(cfg, "entropy_coef", default=0.001)
+        self.clip_param = OmegaConf.select(cfg, "clip_param", default=0.1)
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.n_agents, self.action_dim = action_spec.shape[-2:]
         self.gae = GAE(0.99, 0.95)
@@ -165,8 +166,10 @@ class PPOPolicy(TensorDictModuleBase):
             self.actor.apply(init_)
             self.critic.apply(init_)
 
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=5e-4)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=5e-4)
+        actor_lr = OmegaConf.select(cfg, "actor.lr", default=5e-4)
+        critic_lr = OmegaConf.select(cfg, "critic.lr", default=5e-4)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.value_norm = ValueNorm1(reward_spec.shape[-2:]).to(self.device)
 
     def __call__(self, tensordict: TensorDict):
@@ -235,8 +238,9 @@ class PPOPolicy(TensorDictModuleBase):
         self.actor_opt.zero_grad()
         self.critic_opt.zero_grad()
         loss.backward()
-        actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), 5)
-        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), 5)
+        max_grad_norm = OmegaConf.select(self.cfg, "max_grad_norm", default=5.0)
+        actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_grad_norm)
+        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), max_grad_norm)
         self.actor_opt.step()
         self.critic_opt.step()
         explained_var = 1 - F.mse_loss(values, b_returns) / b_returns.var()

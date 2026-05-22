@@ -75,19 +75,13 @@ python train.py algo=ppo headless=true task=InvPendulum/InvPendulumHover total_f
 
 python train.py algo=ppo headless=true task=Hover task.drone_model.name=DifferentialUAV total_frames=200_000_000 wandb.mode=offline
 
-python train.py algo=ppo headless=true task=Payload/PayloadTrack \
-  task.drone_model.name=DifferentialUAV total_frames=200_000_000 \
-  wandb.mode=offline \
-  +algo.actor.lr=0.0001 +algo.critic.lr=0.0001 \
-  +algo.max_grad_norm=1.0 algo.ppo_epochs=2
+python train.py algo=mappo headless=true task=Transport/TransportTrack \
+  task.drone_model.name=DifferentialUAV \
+  total_frames=100_000_000 wandb.mode=offline \
+  algo.actor.lr=0.0001 algo.critic.lr=0.0001 \
+  algo.max_grad_norm=1.0 algo.entropy_coef=0.01
 
 ```
-
-2026-03-19 02:21:25 [14,269ms] [Error] [omni.physx.plugin] PhysX error: PxRigidDynamic::setAngularVelocity(): it is illegal to call this method if PxSceneFlag::eENABLE_DIRECT_GPU_API is enabled!, FILE /builds/omniverse/physics/physx/source/physx/src/NpRigidDynamic.cpp, LINE 267
-2026-03-19 02:21:25 [14,269ms] [Error] [omni.physx.plugin] PhysX error: PxRigidDynamic::setGlobalPose(): it is illegal to call this method if PxSceneFlag::eENABLE_DIRECT_GPU_API is enabled!, FILE /builds/omniverse/physics/physx/source/physx/src/NpRigidDynamic.cpp, LINE 102
-2026-03-19 02:21:25 [14,269ms] [Error] [omni.physx.plugin] PhysX error: PxRigidDynamic::setLinearVelocity(): it is illegal to call this method if PxSceneFlag::eENABLE_DIRECT_GPU_API is enabled!, FILE /builds/omniverse/physics/physx/source/physx/src/NpRigidDynamic.cpp, LINE 239
-2026-03-19 02:21:25 [14,269ms] [Error] [omni.physx.plugin] PhysX error: PxRigidDynamic::setAngularVelocity(): it is illegal to call this method if PxSceneFlag::eENABLE_DIRECT_GPU_API is enabled!, FILE
-
 
 
 

@@ -105,6 +105,36 @@ angular_rate_gain: [0.18, 0.18, 0.06]
 
 ## 自定义无人机训练注意事项
 
+### PPO vs MAPPO：单机 vs 多机任务
+
+OmniDrones 有两套 PPO 实现，**必须根据任务类型选择**：
+
+| 算法 key | Python 类 | 适用场景 | Critic 输入 |
+|----------|-----------|---------|-------------|
+| `"ppo"` | `PPOPolicy` (`ppo/ppo.py`) | 单机任务 (Hover/PayloadTrack 等) | 每个 agent 局部观测 |
+| `"mappo"` | `MAPPO` (`mappo_new.py`) | 多机协同 (TransportTrack/Platform 等) | 全局 `observation_central` |
+
+多机任务（Transport/TransportTrack 等）中 reward 是共享的，用 `algo=ppo`（去中心化 Critic）会导致信用分配失效 → 训练不收敛。必须用 `algo=mappo`（中心化 Critic）。
+
+**注意：** `mappo_new.py` 和 `ppo/ppo.py` 原本硬编码了 `entropy_coef=0.001`、`lr=5e-4`、`max_grad_norm=5.0`，**Hydra YAML/命令行的参数覆盖被完全忽略**。已于 2026-05-22 修复，改为通过 `OmegaConf.select(cfg, key, default=...)` 读取配置。
+
+### TransportTrack 多机运输任务
+
+4 架无人机协同搬运箱形负载，跟踪 lemniscate 轨迹。**默认配置 `num_envs=1` 加上低 entropy_coef 会导致熵崩塌（entropy → 负值），策略坍缩为确定性、episode 卡在 ~80 步无法进步。** 训练必须：
+
+1. 使用 `algo=mappo`（中心化 Critic）
+2. 提高 `entropy_coef` 到 0.01 防止策略坍缩
+3. 增加 `num_envs` 到至少 16-32
+
+```bash
+python train.py algo=mappo headless=true task=Transport/TransportTrack \
+  task.drone_model.name=DifferentialUAV \
+  total_frames=10_000_000 wandb.mode=offline \
+  env.num_envs=32 \
+  algo.actor.lr=0.0001 algo.critic.lr=0.0001 \
+  algo.max_grad_norm=1.0 algo.entropy_coef=0.01
+```
+
 ### 推力灵敏度差异导致梯度爆炸
 
 PayLoadTrack / TransportTrack 等任务中，RL 策略**直接控制旋翼转速**（不经过控制器）。不同无人机的 KF（最大推力/旋翼）差异导致策略对动作的灵敏度不同：同一动作值 `cmd` 映射为 `clamp((cmd+1)/2, 0, 1) × KF`，即 **∂thrust/∂cmd = KF/2**。

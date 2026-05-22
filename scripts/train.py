@@ -83,15 +83,17 @@ def main(cfg):
 
     try:
         # 从算法注册表加载策略（如ppo→PPOPolicy，mappo→MAPPOPolicy）
-        policy = ALGOS[cfg.algo.name.lower()](
-            cfg.algo,
-            env.observation_spec,  # 观测空间规格
-            env.action_spec,       # 动作空间规格
-            env.reward_spec,       # 奖励空间规格
-            device=base_env.device  # 设备（默认cuda）
-        )
+        policy_cls = ALGOS[cfg.algo.name.lower()]
     except KeyError:
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
+
+    policy = policy_cls(
+        cfg.algo,
+        env.observation_spec,  # 观测空间规格
+        env.action_spec,       # 动作空间规格
+        env.reward_spec,       # 奖励空间规格
+        device=base_env.device  # 设备（默认cuda）
+    )
 
     # 批次配置（环境数 × 训练间隔 = 每个批次的帧数）
     frames_per_batch = env.num_envs * int(cfg.algo.train_every)

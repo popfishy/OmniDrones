@@ -44,6 +44,8 @@ from torchrl.data import TensorSpec, CompositeSpec
 from torchrl.envs.transforms import CatTensors
 from einops.layers.torch import Rearrange, Reduce
 
+from omegaconf import OmegaConf
+
 from .ppo.common import GAE, make_mlp
 from .modules.distributions import IndependentNormal
 from .utils.valuenorm import ValueNorm1
@@ -109,7 +111,14 @@ class EnsembleModule(_EnsembleModule):
         params_td = make_functional(module).expand(num_copies).to_tensordict()
         self.module = module
         self.vmapped_forward = vmap(self.module, (1, 0), 1)
-        self.reset_parameters_recursive(params_td)
+        # Manually re-init params: reset_parameters_recursive has a KeyError bug
+        # in older TorchRL versions (PyTorch 2.2 era)
+        def _reset(t):
+            if t.ndim >= 2:
+                nn.init.orthogonal_(t, gain=0.01)
+            elif t.ndim == 1:
+                nn.init.constant_(t, 0.)
+        params_td.apply_(_reset)
         self.params_td = TensorDictParams(params_td)
 
     def forward(self, tensordict: TensorDict):
@@ -137,8 +146,8 @@ class MAPPO:
         super().__init__()
         self.cfg = cfg
         self.device = device
-        self.entropy_coef = 0.001
-        self.clip_param = 0.1
+        self.entropy_coef = OmegaConf.select(cfg, "entropy_coef", default=0.001)
+        self.clip_param = OmegaConf.select(cfg, "clip_param", default=0.1)
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.gae = GAE(0.99, 0.95)
 
@@ -181,8 +190,10 @@ class MAPPO:
         self.critic(fake_input)
         self.critic.apply(init_)
 
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=5e-4)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=5e-4)
+        actor_lr = OmegaConf.select(cfg, "actor.lr", default=5e-4)
+        critic_lr = OmegaConf.select(cfg, "critic.lr", default=5e-4)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.value_norm = ValueNorm1(input_shape=1).to(self.device)
 
     def __call__(self, tensordict: TensorDict):
@@ -248,8 +259,9 @@ class MAPPO:
         self.actor_opt.zero_grad()
         self.critic_opt.zero_grad()
         loss.backward()
-        actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), 5)
-        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), 5)
+        max_grad_norm = OmegaConf.select(self.cfg, "max_grad_norm", default=5.0)
+        actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_grad_norm)
+        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), max_grad_norm)
         self.actor_opt.step()
         self.critic_opt.step()
         explained_var = 1 - F.mse_loss(values, b_returns) / b_returns.var()
