@@ -121,13 +121,14 @@ def main(cfg):
         seed: int=0,
         exploration_type: ExplorationType=ExplorationType.MODE
     ):
+        record_video = cfg.get("record_video", True)
 
-        base_env.enable_render(True) # 启用渲染（生成视频）
-        base_env.eval() 
+        base_env.enable_render(record_video)
+        base_env.eval()
         env.eval()
         env.set_seed(seed)
 
-        render_callback = RenderCallback(interval=2)
+        render_callback = RenderCallback(interval=2) if record_video else None
 
         with set_exploration_type(exploration_type):
             trajs = env.rollout(
@@ -158,18 +159,12 @@ def main(cfg):
             for k, v in traj_stats.items()
         }
 
-        # log video
-        info["recording"] = wandb.Video(
-            render_callback.get_video_array(axes="t c h w"),
-            fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
-            format="mp4"
-        )
-
-        # log distributions
-        # df = pd.DataFrame(traj_stats)
-        # table = wandb.Table(dataframe=df)
-        # info["eval/return"] = wandb.plot.histogram(table, "return")
-        # info["eval/episode_len"] = wandb.plot.histogram(table, "episode_len")
+        if record_video:
+            info["recording"] = wandb.Video(
+                render_callback.get_video_array(axes="t c h w"),
+                fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
+                format="mp4"
+            )
 
         return info
 
