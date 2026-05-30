@@ -202,7 +202,7 @@ def main(cfg):
                 torch.save(policy.state_dict(), ckpt_path)
                 logging.info(f"Saved checkpoint to {str(ckpt_path)}")
             except AttributeError:
-                logging.warning(f"Policy {policy} does not implement `.state_dict()`")
+                logging.warning(f"WARNING: Policy {policy} does not implement `.state_dict()`. Checkpoint NOT saved!")
 
         # 5. 日志写入WandB
         run.log(info)

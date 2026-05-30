@@ -201,6 +201,22 @@ class MAPPO:
         self.critic(tensordict)
         return tensordict
 
+    def state_dict(self):
+        return {
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "actor_opt": self.actor_opt.state_dict(),
+            "critic_opt": self.critic_opt.state_dict(),
+            "value_norm": self.value_norm.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict):
+        self.actor.load_state_dict(state_dict["actor"])
+        self.critic.load_state_dict(state_dict["critic"])
+        self.actor_opt.load_state_dict(state_dict["actor_opt"])
+        self.critic_opt.load_state_dict(state_dict["critic_opt"])
+        self.value_norm.load_state_dict(state_dict["value_norm"])
+
     def train_op(self, tensordict: TensorDict):
         next_tensordict = tensordict["next"]
         with torch.no_grad():
