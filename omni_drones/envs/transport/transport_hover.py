@@ -87,6 +87,7 @@ class TransportHover(IsaacEnv):
         self.reward_distance_scale = cfg.task.reward_distance_scale
         self.time_encoding = cfg.task.time_encoding
         self.safe_distance = cfg.task.safe_distance
+        self.action_scale = cfg.task.get("action_scale", 1.0)
 
         super().__init__(cfg, headless)
 
@@ -248,7 +249,7 @@ class TransportHover(IsaacEnv):
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
-        self.effort = self.drone.apply_action(actions)
+        self.effort = self.drone.apply_action(actions * self.action_scale)
 
     def _compute_state_and_obs(self):
         self.drone_states = self.drone.get_state()
@@ -319,36 +320,57 @@ class TransportHover(IsaacEnv):
             / self.group.joint_limits[..., :16, 0].abs()
         )
 
-        distance = torch.norm(self.target_payload_rpose, dim=-1, keepdim=True)
-        separation = self.drone_pdist.min(dim=-2).values.min(dim=-2).values
+        N, K = self.num_envs, self.drone.n
 
-        reward = torch.zeros(self.num_envs, self.drone.n, 1, device=self.device)
-        reward_pose = torch.exp(-distance * self.reward_distance_scale)
+        # Fix 1: 解耦位置和朝向，不再混成 6D 距离
+        reward_pose = (
+            torch.exp(-self.pos_error * self.reward_distance_scale)       # 纯位置 3D
+            * torch.square((self.heading_alignment + 1) / 2)               # 朝向对齐
+        )
 
+        # 保持原始公式的其余部分
         up = self.payload_up[:, 2]
-        reward_up = torch.square((up + 1) / 2).unsqueeze(-1)
+        reward_up = torch.square((up + 1) / 2)
 
-        spinnage = vels[:, -3:].abs().sum(-1, keepdim=True)
+        spinnage = vels[:, -3:].abs().sum(-1)
         reward_spin = self.reward_spin_weight * torch.exp(-torch.square(spinnage))
 
-        swing = vels[:, :3].abs().sum(-1, keepdim=True)
+        swing = vels[:, :3].abs().sum(-1)
         reward_swing = self.reward_swing_weight * torch.exp(-torch.square(swing))
 
-        reward_effort = self.reward_effort_weight * torch.exp(-self.effort).mean(-1, keepdim=True)
-        reward_separation = torch.square(separation / self.safe_distance).clamp(0, 1)
+        reward_effort = self.reward_effort_weight * torch.exp(-self.effort).mean(-1)
         reward_joint_limit = 0.5 * torch.mean(1 - torch.square(joint_positions), dim=-1)
-
         reward_action_smoothness = self.reward_action_smoothness_weight * -self.drone.throttle_difference
 
-        reward[:] = (
-            reward_separation * (
-                reward_pose
-                + reward_pose * (reward_up + reward_spin + reward_swing)
-                + reward_joint_limit
-                + reward_action_smoothness.mean(1, True)
-                + reward_effort
-            )
-        ).unsqueeze(-1)
+        # Fix 2: 分离惩罚从乘法改为轻度加法
+        separation = self.drone_pdist.min(dim=-2).values.min(dim=-2).values
+        reward_separation = torch.square(separation / self.safe_distance).clamp(0, 1)
+        separation_penalty = (1.0 - reward_separation) * 0.3   # max 0.3 的轻度惩罚
+
+        # 原始公式结构: r_pose + r_pose * bonuses + independent terms
+        # 唯一改动: r_separation 从乘法因子变为减法惩罚
+        # 所有项先强制 reshape 到 (N, 1)，再组合，避免广播维度爆炸
+
+        r_pose = reward_pose.reshape(N, 1)
+        r_up = reward_up.reshape(N, 1)
+        r_spin = reward_spin.reshape(N, 1)
+        r_swing = reward_swing.reshape(N, 1)
+        r_joint = reward_joint_limit.reshape(N, 1)
+        r_effort = reward_effort.reshape(N, 1)
+        r_smooth = reward_action_smoothness.mean(-1, keepdim=True).reshape(N, 1)
+        r_sep = separation_penalty.reshape(N, 1)
+
+        reward_base = (
+            r_pose
+            + r_pose * (r_up + r_spin + r_swing)
+            + r_joint
+            + r_smooth
+            + r_effort
+            - r_sep
+        ).reshape(N, 1, 1)
+
+        reward = torch.zeros(N, K, 1, device=self.device)
+        reward[:] = reward_base
 
         misbehave = (self.drone_states[..., 2] < 0.2).any(-1, keepdim=True)
         hasnan = torch.isnan(self.drone_states).any(-1)
