@@ -32,3 +32,4 @@ ravel_obs: true
 ravel_obs_central: true
 
 action_transform: null
+action_scale: 1.0

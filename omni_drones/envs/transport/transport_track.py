@@ -97,6 +97,7 @@ class TransportTrack(IsaacEnv):
         self.time_encoding = cfg.task.time_encoding
         self.future_traj_steps = int(cfg.task.future_traj_steps)
         self.safe_distance = cfg.task.safe_distance
+        self.action_scale = cfg.task.get("action_scale", 1.0)
         super().__init__(cfg, headless)
 
         self.group.initialize()
@@ -265,7 +266,7 @@ class TransportTrack(IsaacEnv):
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
-        self.effort = self.drone.apply_action(actions)
+        self.effort = self.drone.apply_action(actions * self.action_scale)
 
     def _compute_state_and_obs(self):
         self.drone_states = self.drone.get_state()

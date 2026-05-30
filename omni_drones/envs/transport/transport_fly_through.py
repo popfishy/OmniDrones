@@ -84,6 +84,7 @@ class TransportFlyThrough(IsaacEnv):
         self.reward_distance_scale = cfg.task.reward_distance_scale
         self.reward_action_smoothness_weight = cfg.task.reward_action_smoothness_weight
         self.safe_distance = cfg.task.safe_distance
+        self.action_scale = cfg.task.get("action_scale", 1.0)
         self.obstacle_spacing = cfg.task.obstacle_spacing
         self.reset_on_collision = cfg.task.reset_on_collision
         self.collision_penalty = cfg.task.collision_penalty
@@ -249,7 +250,7 @@ class TransportFlyThrough(IsaacEnv):
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
-        self.effort = self.drone.apply_action(actions)
+        self.effort = self.drone.apply_action(actions * self.action_scale)
 
     def _compute_state_and_obs(self):
         self.drone_states = self.drone.get_state()
