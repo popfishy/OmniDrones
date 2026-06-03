@@ -25,23 +25,31 @@ python train.py algo=ppo headless=true task=Hover total_frames=200_000_000 wandb
 # 单机轨迹跟踪
 python train.py algo=ppo headless=true task=Track total_frames=200_000_000 wandb.mode=offline
 
-# 多机协同搬运（Hummingbird）
+# 多机前往目标点
 python train.py algo=mappo headless=true task=Transport/TransportHover \
-  total_frames=50_000_000 wandb.mode=offline \
-  algo.entropy_coef=0.01
+  task.drone_model.name=DifferentialUAV \
+  total_frames=40_000_000 wandb.mode=offline \
+  algo.entropy_coef=0.01 \
+  task.action_scale=0.5
 
 
 # 多机协同搬运 + DifferentialUAV
 python train.py algo=mappo headless=true task=Transport/TransportTrack \
-  task.drone_model.name=DifferentialUAV \
-  total_frames=50_000_000 wandb.mode=offline \
-  algo.entropy_coef=0.01 \
-  task.action_scale=0.5
+  total_frames=40_000_000 wandb.mode=offline \
+  algo.entropy_coef=0.01
+
 
 python train.py algo=mappo headless=true task=Transport/TransportTrack \
   task.drone_model.name=DifferentialUAV \
   total_frames=40_000_000 wandb.mode=offline \
   algo.entropy_coef=0.01
+
+# 多无人机绳网捕捉
+python train.py algo=mappo headless=true task=NetCapture/NetCapture \
+  total_frames=100 wandb.mode=offline
+
+
+
 ```
 
 更多训练命令见 [tasks.md](docs/source/demo/tasks.md)。
