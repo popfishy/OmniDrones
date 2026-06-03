@@ -66,6 +66,7 @@ def create_rope(
     rope_stiffness: float = 1.0,
     color=(0.4, 0.2, 0.1),
     enable_collision: bool = False,
+    exclude_from_articulation: bool = True,
 ):
     if isinstance(from_prim, str):
         from_prim = prim_utils.get_prim_at_path(from_prim)
@@ -163,11 +164,11 @@ def create_rope(
 
     if from_prim is not None:
         joint: Usd.Prim = script_utils.createJoint(stage, "Fixed", from_prim, links[-1])
-        # joint.GetAttribute('physics:excludeFromArticulation').Set(True)
+        joint.GetAttribute("physics:excludeFromArticulation").Set(exclude_from_articulation)
 
     if to_prim is not None:
         joint: Usd.Prim = script_utils.createJoint(stage, "Fixed", links[0], to_prim)
-        joint.GetAttribute("physics:excludeFromArticulation").Set(True)
+        joint.GetAttribute("physics:excludeFromArticulation").Set(exclude_from_articulation)
 
     return links
 
@@ -242,5 +243,172 @@ def create_bar(
         joint.GetAttribute("drive:rotY:physics:damping").Set(0.0002)
 
     return prim
+
+
+def _lock_d6_trans_and_rotx(joint: Usd.Prim):
+    """Lock transX/Y/Z and rotX on a D6 joint (low > high = locked in PhysX).
+
+    Call this ONCE per D6 joint before setting the desired rotY/rotZ limits/drives.
+    """
+    for dof in ("transX", "transY", "transZ", "rotX"):
+        limit_api = UsdPhysics.LimitAPI.Apply(joint, dof)
+        limit_api.CreateLowAttr(1.0)
+        limit_api.CreateHighAttr(-1.0)
+
+
+def create_net(
+    xform_path: str = "/World/net",
+    rows: int = 5,
+    cols: int = 5,
+    spacing: float = 0.5,
+    node_radius: float = 0.02,
+    node_mass: float = 0.01,
+    corner_mass: float = 0.02,
+    edge_damping: float = 10.0,
+    edge_stiffness: float = 1.0,
+    color: tuple = (0.3, 0.3, 0.3),
+    enable_collision: bool = True,
+) -> dict:
+    """Create a 2D net grid of sphere nodes connected by Capsule+D6 joint edges.
+
+    Capsule edges are placed between adjacent nodes with D6 joints anchored
+    at the node centres and capsule end-faces — no gap, no overlap trick.
+
+    Returns:
+        dict with keys ``nodes`` (list of lists of Usd.Prim),
+        ``edges_h``, ``edges_v``.
+    """
+    stage = stage_utils.get_current_stage()
+    net_xform = UsdGeom.Xform.Define(stage, xform_path)
+    net_xform.AddTranslateOp().Set(Gf.Vec3f(0, 0, 0))
+
+    # Centre the net around origin in XY
+    x_offset = -(cols - 1) * spacing / 2.0
+    y_offset = (rows - 1) * spacing / 2.0
+
+    # ---- 1.  Create nodes ----
+    node_prims: list = []
+    for r in range(rows):
+        row_prims: list = []
+        for c in range(cols):
+            node_path = f"{xform_path}/node_{r}_{c}"
+            pos_x = x_offset + c * spacing
+            pos_y = y_offset - r * spacing
+
+            sphere = UsdGeom.Sphere.Define(stage, node_path)
+            sphere.CreateRadiusAttr(node_radius)
+            sphere.AddTranslateOp().Set(Gf.Vec3f(pos_x, pos_y, 0))
+            sphere.CreateDisplayColorAttr().Set([color])
+
+            script_utils.setRigidBody(sphere.GetPrim(), "convexHull", False)
+
+            is_corner = (r == 0 or r == rows - 1) and (c == 0 or c == cols - 1)
+            mass_val = corner_mass if is_corner else node_mass
+            mass_api = UsdPhysics.MassAPI.Apply(sphere.GetPrim())
+            mass_api.CreateMassAttr().Set(mass_val)
+
+            sphere.GetPrim().GetAttribute("physics:collisionEnabled").Set(enable_collision)
+            row_prims.append(sphere.GetPrim())
+        node_prims.append(row_prims)
+
+    link_radius = 0.015
+    half_len = spacing / 2.0  # capsule half-length
+
+    # Helper: apply rotY/Z drive + lock other DOFs on a D6 joint.
+    def _configure_edge_joint(joint: Usd.Prim):
+        _lock_d6_trans_and_rotx(joint)
+        joint.GetAttribute("limit:rotY:physics:low").Set(-110)
+        joint.GetAttribute("limit:rotY:physics:high").Set(110)
+        joint.GetAttribute("limit:rotZ:physics:low").Set(-110)
+        joint.GetAttribute("limit:rotZ:physics:high").Set(110)
+        UsdPhysics.DriveAPI.Apply(joint, "rotY")
+        UsdPhysics.DriveAPI.Apply(joint, "rotZ")
+        joint.GetAttribute("drive:rotY:physics:damping").Set(edge_damping)
+        joint.GetAttribute("drive:rotY:physics:stiffness").Set(edge_stiffness)
+        joint.GetAttribute("drive:rotZ:physics:damping").Set(edge_damping)
+        joint.GetAttribute("drive:rotZ:physics:stiffness").Set(edge_stiffness)
+
+    # ---- 2.  Horizontal edges  ----
+    edges_h: list = []
+    for r in range(rows):
+        for c in range(cols - 1):
+            edge_path = f"{xform_path}/edge_h_{r}_{c}"
+            a = node_prims[r][c]       # left node
+            b = node_prims[r][c + 1]   # right node
+
+            # Xform at midpoint — capsules are oriented along X by default
+            edge_xform = UsdGeom.Xform.Define(stage, edge_path)
+            edge_xform.AddTranslateOp().Set(
+                Gf.Vec3f(x_offset + c * spacing + half_len,
+                         y_offset - r * spacing, 0))
+
+            capsule = UsdGeom.Capsule.Define(stage, f"{edge_path}/capsule")
+            capsule.CreateHeightAttr(spacing)
+            capsule.CreateRadiusAttr(link_radius)
+            capsule.CreateAxisAttr("X")               # capsule along X
+            capsule.CreateDisplayColorAttr().Set([color])
+
+            UsdPhysics.RigidBodyAPI.Apply(capsule.GetPrim())
+            UsdPhysics.MassAPI.Apply(capsule.GetPrim()).CreateMassAttr().Set(0.005)
+            UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
+            capsule.GetPrim().GetAttribute("physics:collisionEnabled").Set(False)
+
+            # Joint left  node (a) → capsule: anchor at node centre & capsule -X end
+            j_a: Usd.Prim = script_utils.createJoint(stage, "D6", a, capsule.GetPrim())
+            j_a.GetAttribute("physics:localPos0").Set((0.0, 0.0, 0.0))   # node centre
+            j_a.GetAttribute("physics:localPos1").Set((-half_len, 0.0, 0.0))  # capsule -X end
+            _configure_edge_joint(j_a)
+
+            # Joint capsule → right node (b): anchor at capsule +X end & node centre
+            j_b: Usd.Prim = script_utils.createJoint(stage, "D6", capsule.GetPrim(), b)
+            j_b.GetAttribute("physics:localPos0").Set((half_len, 0.0, 0.0))    # capsule +X end
+            j_b.GetAttribute("physics:localPos1").Set((0.0, 0.0, 0.0))          # node centre
+            _configure_edge_joint(j_b)
+
+            edges_h.append((capsule.GetPrim(), a, b))
+
+    # ---- 3.  Vertical edges  ----
+    edges_v: list = []
+    for r in range(rows - 1):
+        for c in range(cols):
+            edge_path = f"{xform_path}/edge_v_{r}_{c}"
+            a = node_prims[r][c]       # upper node
+            b = node_prims[r + 1][c]   # lower node
+
+            # Xform at midpoint, rotated 90° around Z so capsule-X = world-Y
+            edge_xform = UsdGeom.Xform.Define(stage, edge_path)
+            edge_xform.AddTranslateOp().Set(
+                Gf.Vec3f(x_offset + c * spacing,
+                         y_offset - r * spacing - half_len, 0))
+            edge_xform.AddRotateXYZOp().Set(Gf.Vec3f(0, 0, 90))
+
+            capsule = UsdGeom.Capsule.Define(stage, f"{edge_path}/capsule")
+            capsule.CreateHeightAttr(spacing)
+            capsule.CreateRadiusAttr(link_radius)
+            capsule.CreateAxisAttr("X")               # capsule along X → world-Y after xform rotation
+            capsule.CreateDisplayColorAttr().Set([color])
+
+            UsdPhysics.RigidBodyAPI.Apply(capsule.GetPrim())
+            UsdPhysics.MassAPI.Apply(capsule.GetPrim()).CreateMassAttr().Set(0.005)
+            UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
+            capsule.GetPrim().GetAttribute("physics:collisionEnabled").Set(False)
+
+            # Joint upper node (a) → capsule:
+            #   capsule local +X → world +Y → toward upper node
+            j_a: Usd.Prim = script_utils.createJoint(stage, "D6", a, capsule.GetPrim())
+            j_a.GetAttribute("physics:localPos0").Set((0.0, 0.0, 0.0))      # node centre
+            j_a.GetAttribute("physics:localPos1").Set((half_len, 0.0, 0.0))  # capsule +X end
+            _configure_edge_joint(j_a)
+
+            # Joint capsule → lower node (b):
+            #   capsule local -X → world -Y → toward lower node
+            j_b: Usd.Prim = script_utils.createJoint(stage, "D6", capsule.GetPrim(), b)
+            j_b.GetAttribute("physics:localPos0").Set((-half_len, 0.0, 0.0))  # capsule -X end
+            j_b.GetAttribute("physics:localPos1").Set((0.0, 0.0, 0.0))         # node centre
+            _configure_edge_joint(j_b)
+
+            edges_v.append((capsule.GetPrim(), a, b))
+
+    return {"nodes": node_prims, "edges_h": edges_h, "edges_v": edges_v}
 
 

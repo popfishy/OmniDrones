@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2023 Botian Xu, Tsinghua University
+# Copyright (c) 2026 Jiaqi Yang, University of Defence Technology
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -20,22 +20,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-
-from .single import Hover, Track, FlyThrough
-from .payload import PayloadHover, PayloadTrack, PayloadFlyThrough
-from .inv_pendulum import InvPendulumHover, InvPendulumTrack, InvPendulumFlyThrough
-from .dragon import DragonHover
-from .platform import PlatformHover, PlatformTrack, PlatformFlyThrough
-from .transport import TransportHover, TransportTrack, TransportFlyThrough
 from .net_capture import NetCapture
-from .formation import Formation
-from .rearrange import Rearrange
-from .isaac_env import IsaacEnv
-
-try:
-    from .single import Forest, Pinball
-except ModuleNotFoundError:
-    print(
-        "To run the environments which use `ContactSensor` and `RayCaster`,"
-        "please install Isaac Lab (https://github.com/isaac-sim/IsaacLab)."
-    )

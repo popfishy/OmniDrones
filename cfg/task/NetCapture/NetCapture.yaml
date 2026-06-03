@@ -1,0 +1,50 @@
+name: NetCapture
+
+defaults:
+  # see https://hydra.cc/docs/advanced/overriding_packages/
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 4
+  max_episode_length: 600
+
+drone_model:
+  name: Hummingbird
+  controller: LeePositionController
+
+num_drones: 4
+
+# Net parameters
+net_rows: 6
+net_cols: 6
+net_spacing: 0.25       # distance between adjacent nodes (m) — 5×5 → 1.0m wide
+rope_links: 12           # segments per rope
+rope_link_length: 0.1    # segment length (m) — total ~1.2m
+
+# Target parameters
+target_size: [0.3, 0.3, 0.3]  # (x, y, z) metres
+
+# Reward weights — see net_capture.py:_compute_reward_and_done for formulas
+#   r = r_sep · ( w_pos·r_pos + w_head·r_pos·r_head + w_up·r_up + r_eff + r_smooth )
+reward_coverage_weight: 1.5     # w_pos  — position attraction
+reward_descend_weight: 1.0      # w_head — heading alignment (coupled with r_pos)
+reward_up_weight: 0.1           # w_up   — drone upright
+reward_effort_weight: 0.05      # w_eff  — energy penalty (already in r_eff)
+reward_action_smoothness_weight: 0.0  # w_smooth — off for now
+
+# Reward scale
+reward_distance_scale: 3.0      # β — larger = steeper decay, shorter effective range
+
+# Termination
+reset_thres: 3.0         # reset if net centre drifts > 3m from target
+
+# Drone safety
+safe_distance: 0.8
+
+action_scale: 1.0
+
+ravel_obs: true
+ravel_obs_central: true
+
+action_transform: null
