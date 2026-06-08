@@ -42,9 +42,11 @@ import torch
 from omni_drones.envs.net_capture import NetCapture
 
 # ---- Load task config ----
-task_cfg = OmegaConf.load("cfg/task/NetCapture/NetCapture.yaml")
-base_env = OmegaConf.load("cfg/base/env_base.yaml")
-base_sim = OmegaConf.load("cfg/base/sim_base.yaml")
+import os as _os
+_proj_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+task_cfg = OmegaConf.load(_os.path.join(_proj_root, "cfg/task/NetCapture/NetCapture.yaml"))
+base_env = OmegaConf.load(_os.path.join(_proj_root, "cfg/base/env_base.yaml"))
+base_sim = OmegaConf.load(_os.path.join(_proj_root, "cfg/base/sim_base.yaml"))
 task_cfg = OmegaConf.merge(base_env, base_sim, task_cfg)
 task_cfg.env.num_envs = args.envs
 
@@ -82,9 +84,9 @@ print(f"  Ropes:     {cfg.task.rope_links} links × {cfg.task.rope_link_length}m
 print(f"  Nodes:     {cfg.task.net_rows * cfg.task.net_cols} (edges: {cfg.task.net_rows*(cfg.task.net_cols-1) + (cfg.task.net_rows-1)*cfg.task.net_cols})")
 
 # ---- Save USD stage for later inspection ----
-import os
-os.makedirs("scripts/outputs", exist_ok=True)
-usd_path = "scripts/outputs/test_net_capture.usd"
+_out_dir = _os.path.join(_proj_root, "scripts/outputs")
+_os.makedirs(_out_dir, exist_ok=True)
+usd_path = _os.path.join(_out_dir, "test_net_capture.usd")
 stage = omni.usd.get_context().get_stage()
 stage.Export(usd_path)
 print(f"\nUSD stage saved to: {usd_path}")

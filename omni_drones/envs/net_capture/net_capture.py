@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2026 Jiaqi Yang, University of Defence Technology
+# Copyright (c) 2026 Jiaqi Yang, National University of Defense Technology
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -105,6 +105,7 @@ class NetCapture(IsaacEnv):
         # Must be set before super().__init__() because _set_specs() uses them
         self.net_rows = cfg.task.net_rows
         self.net_cols = cfg.task.net_cols
+        self.net_spacing = cfg.task.net_spacing
         self.n_nodes = self.net_rows * self.net_cols
 
         super().__init__(cfg, headless)
@@ -125,15 +126,16 @@ class NetCapture(IsaacEnv):
         )
         self.target_heading_view.initialize()
 
-        # Cache initial drone velocities for reset
-        self.init_drone_vels = torch.zeros_like(self.drone.get_velocities())
+        # Cache initial poses for GPU-compatible ArticulationView reset
+        self.init_drone_pos, self.init_drone_rot = self.drone.get_world_poses(clone=True)
+        self.init_net_pos, self.init_net_rot = self.group.net_articulation.get_world_poses(clone=True)
+        self.init_net_joint = self.group.net_articulation.get_joint_positions(clone=True)
 
-        # Target: 3D point ABOVE initial drone height so drones must fly upward.
-        # Drone z ≈ 3.825 in env frame (3.0 group + 0.825 above net).
-        # Target z ∈ [4.5, 5.5] gives 0.7–1.7 m of upward maneuvering room.
+        # Target above initial drone height (1.325), forcing upward scooping.
+        # Net at 0.5, drones at ~1.325, target at 1.5–2.5.
         self.target_pos_dist = D.Uniform(
-            torch.tensor([-1.0, -1.0, 4.5], device=self.device),
-            torch.tensor([1.0, 1.0, 5.5], device=self.device),
+            torch.tensor([-1.0, -1.0, 1.5], device=self.device),
+            torch.tensor([1.0, 1.0, 2.5], device=self.device),
         )
         self.target_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self.target_heading_vec = torch.zeros(self.num_envs, 3, device=self.device)
@@ -157,7 +159,9 @@ class NetCapture(IsaacEnv):
 
         scene_utils.design_scene()
 
-        self.group.spawn(translations=[(0, 0, 3.0)], enable_collision=True)
+        self.group.spawn(translations=[(0, 0, 0.5)], enable_collision=True)
+        # Net at env z = 0.5, drones at 0.5 + 0.825 = 1.325
+        # Target above drones at z ∈ [1.5, 2.5]
 
         # Visual-only target marker (small sphere, no physics, no collision)
         import omni.isaac.core.utils.prims as prim_utils
@@ -248,18 +252,29 @@ class NetCapture(IsaacEnv):
         self.stats = stats_spec.zero()
 
     def _reset_idx(self, env_ids: torch.Tensor):
-        # Sample target position
+        # Sample target
         target_pos = self.target_pos_dist.sample(env_ids.shape)
         self.target_pos[env_ids] = target_pos
 
-        # Reset drone internal state (throttles, randomization)
+        # ---- Reset drones + rope (one ArticulationView call each) ----
+        n = self.drone.n
         self.drone._reset_idx(env_ids)
-
-        # Zero drone velocities
+        d_pos = self.init_drone_pos.reshape(self.num_envs, n, 3)[env_ids].reshape(-1, 3)
+        d_rot = self.init_drone_rot.reshape(self.num_envs, n, 4)[env_ids].reshape(-1, 4)
+        self.drone.set_world_poses(d_pos, d_rot, env_ids)
         self.drone.set_velocities(
-            torch.zeros(len(env_ids) * self.drone.n, 6, device=self.device),
-            env_indices=env_ids,
-        )
+            torch.zeros(len(env_ids) * n, 6, device=self.device), env_ids)
+
+        # ---- Reset net (ArticulationView — GPU compatible) ----
+        net_pos = self.init_net_pos[env_ids].reshape(-1, 3)
+        net_rot = self.init_net_rot[env_ids].reshape(-1, 4)
+        self.group.net_articulation.set_world_poses(net_pos, net_rot, env_ids)
+        self.group.net_articulation.set_joint_positions(
+            self.init_net_joint[env_ids].reshape(-1, self.init_net_joint.shape[-1]),
+            env_ids)
+        self.group.net_articulation.set_joint_velocities(
+            torch.zeros(len(env_ids), self.init_net_joint.shape[-1], device=self.device),
+            env_ids)
 
         # Sample target heading — always upward (z > 0).
         # Uniform direction in the upper hemisphere with at least 30° upward tilt.
@@ -325,7 +340,8 @@ class NetCapture(IsaacEnv):
         self.net_centre_vel = net_vel[..., :3].reshape(self.num_envs, -1, 3).mean(dim=1)  # (num_envs, 3)
 
         # Corner nodes: (0,0), (0,-1), (-1,0), (-1,-1)
-        corner_pos = torch.stack([
+        # Instance variable for reward function (stretch penalty)
+        self.corner_pos = torch.stack([
             net_pos_grid[:, 0, 0],
             net_pos_grid[:, 0, -1],
             net_pos_grid[:, -1, 0],
@@ -339,8 +355,8 @@ class NetCapture(IsaacEnv):
         ], dim=1)  # (num_envs, 4, 3) — linear velocity only
 
         # Compute net normal from corner cross product
-        v1 = corner_pos[:, 1] - corner_pos[:, 0]  # n02 - n00
-        v2 = corner_pos[:, 2] - corner_pos[:, 0]  # n20 - n00
+        v1 = self.corner_pos[:, 1] - self.corner_pos[:, 0]  # n02 - n00
+        v2 = self.corner_pos[:, 2] - self.corner_pos[:, 0]  # n20 - n00
         self.net_normal = torch.nn.functional.normalize(
             torch.cross(v1, v2, dim=-1), dim=-1
         )  # (num_envs, 3)
@@ -351,7 +367,7 @@ class NetCapture(IsaacEnv):
         # Relative positions
         drone_pos = self.drone_states[..., :3]  # (num_envs, n, 3)
         net_centre_rpos = self.net_centre.unsqueeze(1) - drone_pos  # drone → net centre
-        corner_rpos = corner_pos.unsqueeze(2) - drone_pos.unsqueeze(1)  # (N, 4, n, 3)
+        corner_rpos = self.corner_pos.unsqueeze(2) - drone_pos.unsqueeze(1)  # (N, 4, n, 3)
         target_rpos = target_pos.unsqueeze(1) - drone_pos  # drone → target (n, 3)
 
         # Drone inter-relative positions
@@ -434,59 +450,80 @@ class NetCapture(IsaacEnv):
 
     def _compute_reward_and_done(self):
         """
-        Reward function (shared across all K drones):
+        "Scooping" reward — fly net beneath target, lift from below.
 
         Let:
-          p_net  ∈ ℝ³ : net centre position
-          n_net  ∈ ℝ³ : net normal (unit vector)
-          p_tgt  ∈ ℝ³ : target position
-          v_tgt  ∈ ℝ³ : target heading (unit, upward)
-          p_i    ∈ ℝ³ : drone i position
-          u_i    ∈ ℝ³ : drone i up vector (unit)
+          p_net, p_tgt ∈ ℝ³ : net centre & target position
+          dist_xy = ‖p_net[...,:2] - p_tgt[...,:2]‖   (XY plane)
+          z_diff  = p_tgt_z - p_net_z                    (+ when net below target)
 
-        1.  r_pos = exp(-β · ‖p_tgt - p_net‖)              position: exponential decay with distance
-        2.  r_head = ((n_net · v_tgt + 1) / 2)²            heading: alignment of net normal → target direction
-        3.  r_phead = r_pos · r_head                       coupled: heading only matters when close
-        4.  r_up = mean_i[ ((u_i · e_z + 1) / 2)² ]       upright: drones stay level
-        5.  r_eff = -(w_eff / K) Σ_i throttle_i            effort: energy penalty
-        6.  r_sep = min(1, min_{i≠j} ‖p_i-p_j‖ / d_safe)²  separation: anti-collision factor
-        7.  r_smooth = -(w_smooth / K) Σ_i ‖Δ throttle_i‖  smoothness: abrupt-change penalty
+        1. r_xy      = exp(-2·dist_xy)                   XY alignment under target
+        2. r_z       = exp(-2·z_diff)    if z_diff > 0   climb toward target
+                       exp( 1·z_diff)    if z_diff ≤ 0   stable above target
+        3. r_capture = r_xy · r_z                        full scoop: aligned + lifted
+        4. r_stretch = exp(-2·|diag_ideal - diag_actual|) prevent net collapse
+        5. r_head    = ((n_net·v_tgt + 1)/2)²            heading alignment
+        6. r_phead   = r_capture · r_head                coupled
+        7. r_up      = mean((u_i_z + 1)/2)²              drone upright
+        8. r_eff     = -w_eff · mean(throttle)           energy
+        9. r_smooth  = -w_smooth · mean(Δthrottle)       smoothness
+       10. r_sep     = (min_dist/d_safe)²                anti-collision factor
 
-        Total (per timestep, same for all drones):
-          r = r_sep · ( w_pos·r_pos + w_head·r_phead + w_up·r_up + r_eff + r_smooth )
+        r = r_sep · (w_cap·r_capture + w_head·r_phead + 0.3·r_stretch + w_up·r_up + r_eff + r_smooth)
         """
         target_pos, _ = self.get_env_poses(self.target.get_world_poses())
-
         N, K = self.num_envs, self.drone.n
 
-        # --- 1. Position ---
-        dist = torch.norm(self.net_centre - target_pos, dim=-1, keepdim=True)  # (N, 1)
-        self.net_target_dist = dist
-        r_pos = torch.exp(-dist * self.reward_distance_scale)
+        # --- 1. XY alignment ---
+        dist_xy = torch.norm(self.net_centre[..., :2] - target_pos[..., :2], dim=-1, keepdim=True)
+        self.net_target_dist = torch.norm(self.net_centre - target_pos, dim=-1, keepdim=True)
+        r_xy = torch.exp(-dist_xy * 2.0)
 
-        # --- 2. Heading alignment ---
-        alignment = (self.net_normal * self.target_heading_vec).sum(dim=-1, keepdim=True)  # [-1, 1]
-        r_head = torch.square((alignment + 1) / 2)   # [0, 1], 1 = perfect alignment
-        r_phead = r_pos * r_head                      # coupled
+        # --- 2. Upward scooper ---
+        z_diff = target_pos[..., 2:3] - self.net_centre[..., 2:3]
+        r_z = torch.where(
+            z_diff > 0,
+            torch.exp(-z_diff * 2.0),   # net below: encourage climbing up
+            torch.exp(z_diff * 1.0),     # net above: gentle decay, stay close
+        )
+        r_capture = r_xy * r_z
 
-        # --- 3. Upright ---
-        r_up = torch.square((self.drone.up[..., 2] + 1) / 2).mean(-1, keepdim=True)  # (N, 1)
+        # --- 3. Anti-collapse stretch ---
+        # 6×6 net, spacing=0.25 → edge length = (6-1)*0.25 = 1.25
+        # ideal diagonal = sqrt(1.25² + 1.25²) ≈ 1.7678
+        diag_ideal = (self.net_rows - 1) * self.net_spacing * (2 ** 0.5)
+        diag1 = torch.norm(self.corner_pos[:, 0] - self.corner_pos[:, 3], dim=-1, keepdim=True)
+        diag2 = torch.norm(self.corner_pos[:, 1] - self.corner_pos[:, 2], dim=-1, keepdim=True)
+        r_stretch = torch.exp(-torch.abs(diag1 - diag_ideal) * 2.0) * \
+                    torch.exp(-torch.abs(diag2 - diag_ideal) * 2.0)
 
-        # --- 4. Effort ---
-        r_eff = -self.reward_effort_weight * self.effort.mean(-1, keepdim=True)  # (N, 1)
+        # --- 4. Dynamic scooping: attitude + velocity alignment ---
+        # 4a. Static attitude: net normal aligned with target heading
+        attitude_align = (self.net_normal * self.target_heading_vec).sum(dim=-1, keepdim=True)
+        r_attitude = torch.square((attitude_align + 1) / 2)
 
-        # --- 5. Separation (multiplicative like TransportTrack) ---
-        sep = self.drone_pdist.min(dim=-2).values.min(dim=-2).values  # (N, 1)
-        r_sep = torch.square((sep / self.safe_distance).clamp(0, 1))
+        # 4b. Dynamic velocity: net centre velocity direction aligned with target heading
+        net_speed = torch.norm(self.net_centre_vel, dim=-1, keepdim=True).clamp(min=1e-5)
+        net_vel_dir = self.net_centre_vel / net_speed
+        vel_align = (net_vel_dir * self.target_heading_vec).sum(dim=-1, keepdim=True)
+        r_vel_dir = torch.square((vel_align + 1) / 2)
+        r_speed_scale = (net_speed / 1.0).clamp(0, 1)   # max score at ≥1 m/s
 
-        # --- 6. Action smoothness ---
+        # Combined: must be near target, face right, and MOVE in target direction
+        r_scoop = r_capture * r_attitude * (0.5 + 0.5 * r_vel_dir * r_speed_scale)
+
+        # --- 5. Auxiliary terms ---
+        r_up = torch.square((self.drone.up[..., 2] + 1) / 2).mean(-1, keepdim=True)
+        r_eff = -self.reward_effort_weight * self.effort.mean(-1, keepdim=True)
         r_smooth = -self.reward_action_smoothness_weight * \
-            self.drone.throttle_difference.mean(-1, keepdim=True)  # (N, 1)
+            self.drone.throttle_difference.mean(-1, keepdim=True)
+        sep = self.drone_pdist.min(dim=-2).values.min(dim=-2).values
+        r_sep = torch.square((sep / self.safe_distance).clamp(0, 1))
 
         # --- Total ---
         r_total = (
-            self.reward_coverage_weight * r_pos
-            + self.reward_descend_weight * r_phead
+            self.reward_coverage_weight * r_scoop
+            + 0.3 * r_stretch
             + self.reward_up_weight * r_up
             + r_eff
             + r_smooth
@@ -497,15 +534,13 @@ class NetCapture(IsaacEnv):
 
         # --- Termination ---
         misbehave = (
-            (self.drone_states[..., 2] < 0.2).any(-1, keepdim=True)
-            | (dist > self.reset_thres)
+            (self.drone_states[..., 2] > 5.0).any(-1, keepdim=True)   # runaway
+            | (self.net_target_dist > self.reset_thres)
         )
         hasnan = torch.isnan(self.drone_states).any(-1)
-
         terminated = misbehave | hasnan.any(-1, keepdim=True)
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
 
-        # --- Stats ---
         self.stats["return"].add_(reward.mean(1))
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(-1)
 

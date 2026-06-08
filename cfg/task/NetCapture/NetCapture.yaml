@@ -33,16 +33,16 @@ reward_up_weight: 0.1           # w_up   — drone upright
 reward_effort_weight: 0.05      # w_eff  — energy penalty (already in r_eff)
 reward_action_smoothness_weight: 0.0  # w_smooth — off for now
 
-# Reward scale
-reward_distance_scale: 3.0      # β — larger = steeper decay, shorter effective range
+# Reward scale — lower β gives wider effective range for early exploration
+reward_distance_scale: 1.0      # β — r_pos = exp(-β·dist), effective range ~2m
 
 # Termination
-reset_thres: 3.0         # reset if net centre drifts > 3m from target
+reset_thres: 8.0         # generous threshold for early exploration
 
 # Drone safety
 safe_distance: 0.8
 
-action_scale: 1.0
+action_scale: 0.1        # dampen exploration: 0.1 × random action barely perturbs hover thrust
 
 ravel_obs: true
 ravel_obs_central: true

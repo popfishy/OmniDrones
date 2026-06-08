@@ -244,12 +244,17 @@ class MAPPO:
             for minibatch in batch:
                 infos.append(self._update(minibatch))
 
+        infos = [i for i in infos if len(i.keys()) > 0]
+        if not infos:
+            return {}
         infos: TensorDict = torch.stack(infos).to_tensordict()
         infos = infos.apply(torch.mean, batch_size=[])
         return {k: v.item() for k, v in infos.items()}
 
     def _update(self, tensordict: TensorDict):
         tensordict = tensordict[~tensordict["is_init"].squeeze(1)]
+        if tensordict.shape[0] == 0:
+            return TensorDict({})
         dist = self.actor.get_dist(tensordict)
         log_probs = dist.log_prob(tensordict[("agents", "action")])
         entropy = dist.entropy().mean()
