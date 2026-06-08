@@ -143,18 +143,19 @@ class NetCaptureGroup(RobotBase):
                 )
 
                 r, c = corner_indices[i]
-                corner_node = net_info["nodes"][r][c]
+                corner_node_path = str(net_info["nodes"][r][c].GetPath())
                 drone_base_link = f"{drone_path}/base_link"
 
-                # Rope as independent RigidBodies under GROUP (not inside drone
-                # articulation).  Both ends use excludeFromArticulation=True:
-                # drone is its own articulation, net is an articulation.
+                # Rope as independent RigidBodies under GROUP.
+                # Both FixedJoints use excludeFromArticulation=True:
+                # corner_node is in net articulation, drone is its own
+                # articulation, rope segments are independent RigidBodies.
                 rope_translation = drone_translations[i].tolist()
                 scene_utils.create_rope(
                     xform_path=f"{prim_path}/rope_{i}",
                     translation=rope_translation,
-                    from_prim=corner_node,                # net corner ↔ links[-1]
-                    to_prim=drone_base_link,              # drone     ↔ links[0]
+                    from_prim=corner_node_path,
+                    to_prim=drone_base_link,
                     num_links=self.rope_links,
                     link_length=self.rope_link_length,
                     color=(0.4, 0.2, 0.1),
