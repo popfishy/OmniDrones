@@ -109,7 +109,8 @@ class NetCapture(IsaacEnv):
 
         super().__init__(cfg, headless)
 
-        self.group.initialize()
+        # group.initialize() is now called inside _design_scene() BEFORE sim.reset()
+        # to ensure views are registered before the GPU physics view is created.
 
         # Target is a pure visual prim (no RigidBody) — track position via tensor
         # to avoid GPU API conflicts.  Position set via USD API in _reset_idx.
@@ -187,6 +188,13 @@ class NetCapture(IsaacEnv):
         arrow.AddTranslateOp().Set(Gf.Vec3f(0, 0, 2.0))
         arrow.AddOrientOp().Set(Gf.Quatf(1.0))  # create xformOp:orient so we can set it later
         UsdGeom.Imageable(arrow.GetPrim()).MakeVisible()
+
+        # ---- Initialize all views BEFORE super().__init__ locks the physics ----
+        # This is critical: views must register their prim path patterns while the
+        # stage is still being built.  sim.reset() (called later in IsaacEnv.__init__)
+        # creates the GPU physics simulation view; views initialized after that
+        # point may fail to create their _physics_view handles.
+        self.group.initialize()
 
         return ["/World/defaultGroundPlane"]
 
