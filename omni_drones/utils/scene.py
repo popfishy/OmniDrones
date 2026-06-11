@@ -219,12 +219,12 @@ def create_rope(
 
 def create_pbd_rope(
     xform_path: str = "/World/rope",
-    translation=(0, 0, 0),
+    start_pos: tuple = (0, 0, 0),
+    end_pos: tuple = (1.0, 0, 0),
     particle_system_path: str = "/World/particleSystem",
     from_prim: Union[str, Usd.Prim] = None,
     to_prim: Union[str, Usd.Prim] = None,
     num_particles: int = 12,
-    rope_length: float = 1.2,
     particle_mass: float = 0.01,
     stretch_stiffness: float = 1e4,
     bend_stiffness: float = 2e2,
@@ -248,12 +248,12 @@ def create_pbd_rope(
 
     Args:
         xform_path: USD path for the rope mesh prim.
-        translation: world-space offset for the rope root.
+        start_pos: 3D position of the first rope particle (e.g. drone end).
+        end_pos: 3D position of the last rope particle (e.g. net corner end).
         particle_system_path: Path to the shared PhysxParticleSystem.
         from_prim: Rigid body at the far end (e.g. net corner).
         to_prim: Rigid body at the near end (e.g. drone base_link).
         num_particles: Number of lengthwise particle rows.
-        rope_length: Total rest length of the rope (m).
         particle_mass: Mass per particle row (kg).
         stretch_stiffness: Spring stretch stiffness (force/distance).
         bend_stiffness: Spring bend stiffness.
@@ -268,18 +268,34 @@ def create_pbd_rope(
         from_prim = prim_utils.get_prim_at_path(from_prim)
     if isinstance(to_prim, str):
         to_prim = prim_utils.get_prim_at_path(to_prim)
-    if isinstance(translation, torch.Tensor):
-        translation = translation.tolist()
+    if isinstance(start_pos, torch.Tensor):
+        start_pos = start_pos.tolist()
+    if isinstance(end_pos, torch.Tensor):
+        end_pos = end_pos.tolist()
 
     W = 0.02   # strip width — narrow enough for rope-like behavior
     N = num_particles
 
-    # 1. 2-row strip mesh: row 0 = top, row N..2N-1 = bottom
+    # 1. 2-row strip mesh along the vector from start_pos to end_pos.
+    #    First N vertices = top row, last N = bottom row (offset by W).
+    start = Gf.Vec3f(*start_pos)
+    end = Gf.Vec3f(*end_pos)
+    direction = end - start
+    actual_length = direction.GetLength()
+    if actual_length > 1e-6:
+        dir_norm = direction / actual_length
+    else:
+        dir_norm = Gf.Vec3f(1, 0, 0)
+
+    # Perpendicular offset for strip width
+    perp = Gf.Vec3f(0, 0, 1) if abs(dir_norm[2]) < 0.99 else Gf.Vec3f(0, 1, 0)
+    offset = W / 2.0 * Gf.Cross(dir_norm, perp).GetNormalized()
+
     positions = [
-        Gf.Vec3f(i * rope_length / (N - 1), W / 2, 0.0)
+        Gf.Vec3f(start + dir_norm * (i * actual_length / (N - 1)) + offset)
         for i in range(N)
     ] + [
-        Gf.Vec3f(i * rope_length / (N - 1), -W / 2, 0.0)
+        Gf.Vec3f(start + dir_norm * (i * actual_length / (N - 1)) - offset)
         for i in range(N)
     ]
     face_counts = []
@@ -289,7 +305,7 @@ def create_pbd_rope(
         face_counts.extend([3, 3])
         face_indices.extend([a, c, b, a, d, c])
 
-    # 2. Xform → Mesh
+    # 2. Xform → Mesh (particles in world space, no extra translation needed)
     xform = prim_utils.get_prim_at_path(xform_path)
     if not xform:
         xform = UsdGeom.Xform.Define(stage, xform_path)
@@ -298,8 +314,6 @@ def create_pbd_rope(
     mesh.CreatePointsAttr().Set(positions)
     mesh.CreateFaceVertexCountsAttr().Set(face_counts)
     mesh.CreateFaceVertexIndicesAttr().Set(face_indices)
-    mesh.AddTranslateOp().Set(Gf.Vec3f(*translation))
-    mesh.AddOrientOp().Set(Gf.Quatf(1.0))
 
     # 3. Particle system (one per rope group — caller may share across ropes)
     if not stage.GetPrimAtPath(particle_system_path):
@@ -343,37 +357,34 @@ def create_pbd_rope(
         particle_mass * N * 2
     )
 
-    # 6. PhysicsAttachments with explicit vertex indices.
-    #    PhysxAutoAttachmentAPI (CreatePhysicsAttachment default) auto-selects
-    #    vertices by proximity, which can claim ALL cloth vertices for the first
-    #    attachment, leaving none for the second.  We pin only the endpoint
-    #    vertices explicitly.
-    #    Rope mesh layout:
-    #      top row:    vertices 0 … N-1
-    #      bottom row: vertices N … 2N-1
-    #    "to"   (first column):  indices 0, N    → to_prim (drone)
-    #    "from" (last column):   indices N-1, 2N-1 → from_prim (net corner)
+    # Debug
+    import logging
+    logging.info(f"PBD rope created: mesh={mesh_path}, particles={N*2}, ps={particle_system_path}")
+
+    # 6. PhysicsAttachments
     attachments = []
     if to_prim is not None:
         a_to = Sdf.Path(
             omni.usd.get_stage_next_free_path(stage, f"{mesh_path}/attTo", True)
         )
-        to_attach = PhysxSchema.PhysxPhysicsAttachment.Define(stage, a_to)
-        to_attach.GetActor0Rel().SetTargets([Sdf.Path(mesh_path)])
-        to_attach.GetActor1Rel().SetTargets([to_prim.GetPath()])
-        to_attach.GetFilterType0Attr().Set("Vertices")
-        to_attach.GetCollisionFilterIndices0Attr().Set([0, N])
+        omni.kit.commands.execute(
+            "CreatePhysicsAttachment",
+            target_attachment_path=a_to,
+            actor0_path=Sdf.Path(mesh_path),
+            actor1_path=to_prim.GetPath(),
+        )
         attachments.append(("to", str(a_to)))
 
     if from_prim is not None:
         a_from = Sdf.Path(
             omni.usd.get_stage_next_free_path(stage, f"{mesh_path}/attFrom", True)
         )
-        from_attach = PhysxSchema.PhysxPhysicsAttachment.Define(stage, a_from)
-        from_attach.GetActor0Rel().SetTargets([Sdf.Path(mesh_path)])
-        from_attach.GetActor1Rel().SetTargets([from_prim.GetPath()])
-        from_attach.GetFilterType0Attr().Set("Vertices")
-        from_attach.GetCollisionFilterIndices0Attr().Set([N - 1, 2 * N - 1])
+        omni.kit.commands.execute(
+            "CreatePhysicsAttachment",
+            target_attachment_path=a_from,
+            actor0_path=Sdf.Path(mesh_path),
+            actor1_path=from_prim.GetPath(),
+        )
         attachments.append(("from", str(a_from)))
 
     return {

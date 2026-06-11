@@ -203,20 +203,30 @@ class NetCaptureGroup(RobotBase):
                 corner_node_path = str(net_info["nodes"][r][c].GetPath())
                 drone_base_link = f"{drone_path}/base_link"
 
-                rope_translation = drone_translations[i].tolist()
+                drone_offset = drone_translations[i]
+                # Net corner: same XY as drone, but Z=0 in group-local frame
+                x_offset = -(self.net_cols - 1) * self.net_spacing / 2.0
+                y_offset = (self.net_rows - 1) * self.net_spacing / 2.0
+                cx = x_offset + c * self.net_spacing
+                cy = y_offset - r * self.net_spacing
 
                 if self.cfg.use_pbd_rope:
                     # PBD particle rope — GPU native, no D6 joints
-                    rope_length = self.rope_links * self.rope_link_length
+                    # Compute start/end positions so rope endpoints EXACTLY
+                    # match drone base_link and net corner positions.
+                    # This ensures PhysxAutoAttachmentAPI can find the
+                    # closest particles (proximity search).
+                    start_pos = (translation + drone_offset).tolist()
+                    end_pos = (translation + torch.tensor([cx, cy, 0.], device=self.device)).tolist()
                     ps_path = f"{prim_path}/particleSystem"
                     rope_info = scene_utils.create_pbd_rope(
                         xform_path=f"{prim_path}/rope_pbd_{i}",
-                        translation=rope_translation,
+                        start_pos=start_pos,
+                        end_pos=end_pos,
                         particle_system_path=ps_path,
                         from_prim=corner_node_path,
                         to_prim=drone_base_link,
                         num_particles=self.rope_links,
-                        rope_length=rope_length,
                         particle_mass=self.cfg.pbd_particle_mass,
                         stretch_stiffness=self.cfg.pbd_stretch_stiffness,
                         bend_stiffness=self.cfg.pbd_bend_stiffness,
@@ -228,7 +238,7 @@ class NetCaptureGroup(RobotBase):
                     # Legacy D6 joint rope
                     scene_utils.create_rope(
                         xform_path=f"{prim_path}/rope_{i}",
-                        translation=rope_translation,
+                        translation=drone_offset.tolist(),
                         from_prim=corner_node_path,
                         to_prim=drone_base_link,
                         num_links=self.rope_links,
