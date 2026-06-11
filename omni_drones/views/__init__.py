@@ -457,14 +457,26 @@ class RigidPrimView(_RigidPrimView):
         orientations: Optional[torch.Tensor] = None,
         env_indices: Optional[torch.Tensor] = None,
     ) -> None:
+        # GPU path
+        indices = self._resolve_env_indices(env_indices)
+        if self._physics_view is not None:
+            with disable_warnings(self._physics_sim_view):
+                poses = self._physics_view.get_transforms()
+                if positions is not None:
+                    poses[indices, :3] = positions.reshape(-1, 3)
+                if orientations is not None:
+                    poses[indices, 3:] = orientations.reshape(-1, 4)[:, [1, 2, 3, 0]]
+                self._physics_view.set_transforms(poses, indices)
+                return
+        # CPU fallback — _physics_view was invalidated by timeline STOP.
+        # Suppress warnings: the base class logs spam when GPU view is None.
         with disable_warnings(self._physics_sim_view):
-            indices = self._resolve_env_indices(env_indices)
-            poses = self._physics_view.get_transforms()
-            if positions is not None:
-                poses[indices, :3] = positions.reshape(-1, 3)
-            if orientations is not None:
-                poses[indices, 3:] = orientations.reshape(-1, 4)[:, [1, 2, 3, 0]]
-            self._physics_view.set_transforms(poses, indices)
+            return _RigidPrimView.set_world_poses(
+                self,
+                positions=positions.reshape(-1, 3) if positions is not None else None,
+                orientations=orientations.reshape(-1, 4) if orientations is not None else None,
+                indices=indices,
+            )
 
     def get_velocities(
         self, env_indices: Optional[torch.Tensor] = None, clone: bool = True
@@ -476,7 +488,15 @@ class RigidPrimView(_RigidPrimView):
         self, velocities: torch.Tensor, env_indices: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         indices = self._resolve_env_indices(env_indices)
-        return super().set_velocities(velocities.reshape(-1, 6), indices)
+        if self._physics_view is not None:
+            with disable_warnings(self._physics_sim_view):
+                data = self._physics_view.get_velocities()
+                data[indices] = velocities.reshape(-1, 6)
+                self._physics_view.set_velocities(data, indices)
+                return
+        # CPU fallback — suppressed warnings.
+        with disable_warnings(self._physics_sim_view):
+            return _RigidPrimView.set_velocities(self, velocities.reshape(-1, 6), indices)
 
     def get_net_contact_forces(
         self,

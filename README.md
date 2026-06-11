@@ -46,7 +46,17 @@ python train.py algo=mappo headless=true task=Transport/TransportTrack \
 
 # 多无人机绳网捕捉
 python train.py algo=mappo headless=true task=NetCapture/NetCapture \
-  total_frames=100 wandb.mode=offline
+  total_frames=5_000_000 wandb.mode=offline \
+  algo.entropy_coef=0.01
+
+# 使用 DifferentialUAV
+python train.py algo=mappo headless=true task=NetCapture/NetCapture \
+  task.drone_model.name=DifferentialUAV \
+  total_frames=50_000_000 wandb.mode=offline \
+  algo.actor.lr=0.0001 algo.critic.lr=0.0001 \
+  algo.max_grad_norm=1.0 algo.entropy_coef=0.01 \
+  task.action_scale=0.5
+
 
 
 

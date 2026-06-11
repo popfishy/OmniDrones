@@ -25,8 +25,8 @@ import omni.usd
 import torch
 import torch.distributions as D
 from torch.func import vmap
+from pxr import Gf
 
-import omni_drones.utils.kit as kit_utils
 import omni_drones.utils.scene as scene_utils
 
 from tensordict.tensordict import TensorDict, TensorDictBase
@@ -37,7 +37,6 @@ from torchrl.data import (
 )
 
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
-from omni_drones.views import RigidPrimView
 from omni_drones.utils.torch import (
     cpos,
     off_diag,
@@ -112,24 +111,22 @@ class NetCapture(IsaacEnv):
 
         self.group.initialize()
 
-        # Target is independent — not under the group
-        self.target = RigidPrimView(
-            "/World/envs/.*/target",
-            reset_xform_properties=False,
-        )
-        self.target.initialize()
+        # Target is a pure visual prim (no RigidBody) — track position via tensor
+        # to avoid GPU API conflicts.  Position set via USD API in _reset_idx.
+        self._target_prim_paths = [
+            f"/World/envs/env_{i}/target" for i in range(self.num_envs)
+        ]
+        self._target_heading_prim_paths = [
+            f"/World/envs/env_{i}/target_heading" for i in range(self.num_envs)
+        ]
 
-        # Heading indicator view (visual-only, for pose updates)
-        self.target_heading_view = RigidPrimView(
-            "/World/envs/.*/target_heading",
-            reset_xform_properties=False,
-        )
-        self.target_heading_view.initialize()
-
-        # Cache initial poses for GPU-compatible ArticulationView reset
+        # Cache initial poses for GPU-compatible reset via RigidPrimView
         self.init_drone_pos, self.init_drone_rot = self.drone.get_world_poses(clone=True)
-        self.init_net_pos, self.init_net_rot = self.group.net_articulation.get_world_poses(clone=True)
-        self.init_net_joint = self.group.net_articulation.get_joint_positions(clone=True)
+        # Also cache rotor poses (reset with RigidPrimView alongside base_link)
+        self.init_rotor_pos, self.init_rotor_rot = self.drone.rotors_view.get_world_poses(clone=True)
+        self.init_net_nodes_pos, self.init_net_nodes_rot = self.group.net_nodes_view.get_world_poses(clone=True)
+        self.init_net_edges_pos, self.init_net_edges_rot = self.group.net_edges_view.get_world_poses(clone=True)
+        self.init_rope_segs_pos, self.init_rope_segs_rot = self.group.rope_segs_view.get_world_poses(clone=True)
 
         # Target above initial drone height (1.325), forcing upward scooping.
         # Net at 0.5, drones at ~1.325, target at 1.5–2.5.
@@ -163,34 +160,32 @@ class NetCapture(IsaacEnv):
         # Net at env z = 0.5, drones at 0.5 + 0.825 = 1.325
         # Target above drones at z ∈ [1.5, 2.5]
 
-        # Visual-only target marker (small sphere, no physics, no collision)
+        # Visual-only target marker (pure USD prim, NO RigidBody — avoids GPU API errors)
+        # Position updated via USD API in _reset_idx; read from self.target_pos tensor.
         import omni.isaac.core.utils.prims as prim_utils
-        from pxr import UsdPhysics, UsdGeom, Gf
+        from pxr import UsdGeom, Gf
 
+        target_path = "/World/envs/env_0/target"
         target = prim_utils.create_prim(
-            prim_path="/World/envs/env_0/target",
+            prim_path=target_path,
             prim_type="Sphere",
             translation=(0.0, 0.0, 2.0),
             attributes={"radius": 0.06},
         )
-        UsdPhysics.RigidBodyAPI.Apply(target)
-        UsdPhysics.CollisionAPI.Apply(target)
-        kit_utils.set_collision_properties(target.GetPath(), collision_enabled=False)
-        kit_utils.set_rigid_body_properties(target.GetPath(), disable_gravity=True)
+        UsdGeom.Imageable(target).MakeVisible()
 
         # Heading direction arrow: long capsule along X, rotated to heading in XY plane.
+        arrow_path = "/World/envs/env_0/target_heading"
         arrow = UsdGeom.Capsule.Define(
             omni.usd.get_context().get_stage(),
-            "/World/envs/env_0/target_heading",
+            arrow_path,
         )
         arrow.CreateAxisAttr("X")       # capsule along X (in XY plane)
         arrow.CreateHeightAttr(0.3)     # shaft length 0.3m
         arrow.CreateRadiusAttr(0.015)   # thin shaft
         arrow.AddTranslateOp().Set(Gf.Vec3f(0, 0, 2.0))
-        UsdPhysics.RigidBodyAPI.Apply(arrow.GetPrim())
-        UsdPhysics.CollisionAPI.Apply(arrow.GetPrim())
-        kit_utils.set_collision_properties(arrow.GetPrim().GetPath(), collision_enabled=False)
-        kit_utils.set_rigid_body_properties(arrow.GetPrim().GetPath(), disable_gravity=True)
+        arrow.AddOrientOp().Set(Gf.Quatf(1.0))  # create xformOp:orient so we can set it later
+        UsdGeom.Imageable(arrow.GetPrim()).MakeVisible()
 
         return ["/World/defaultGroundPlane"]
 
@@ -256,25 +251,57 @@ class NetCapture(IsaacEnv):
         target_pos = self.target_pos_dist.sample(env_ids.shape)
         self.target_pos[env_ids] = target_pos
 
-        # ---- Reset drones + rope (one ArticulationView call each) ----
         n = self.drone.n
         self.drone._reset_idx(env_ids)
+
+        # ---- Reset drone bodies (base_link + rotors) atomically ----
+        # Set both base_link and rotor poses back-to-back to avoid a constraint
+        # inconsistency window that would trigger CPU-side PhysX API calls.
         d_pos = self.init_drone_pos.reshape(self.num_envs, n, 3)[env_ids].reshape(-1, 3)
         d_rot = self.init_drone_rot.reshape(self.num_envs, n, 4)[env_ids].reshape(-1, 4)
         self.drone.set_world_poses(d_pos, d_rot, env_ids)
+
+        rot_pos = self.init_rotor_pos.reshape(self.num_envs, n, self.drone.num_rotors, 3)[env_ids]
+        rot_rot = self.init_rotor_rot.reshape(self.num_envs, n, self.drone.num_rotors, 4)[env_ids]
+        self.drone.rotors_view.set_world_poses(rot_pos, rot_rot, env_ids)
+
+        # Zero drone velocities
         self.drone.set_velocities(
             torch.zeros(len(env_ids) * n, 6, device=self.device), env_ids)
+        self.drone.rotors_view.set_velocities(
+            torch.zeros(len(env_ids) * n * self.drone.num_rotors, 6, device=self.device), env_ids)
 
-        # ---- Reset net (ArticulationView — GPU compatible) ----
-        net_pos = self.init_net_pos[env_ids].reshape(-1, 3)
-        net_rot = self.init_net_rot[env_ids].reshape(-1, 4)
-        self.group.net_articulation.set_world_poses(net_pos, net_rot, env_ids)
-        self.group.net_articulation.set_joint_positions(
-            self.init_net_joint[env_ids].reshape(-1, self.init_net_joint.shape[-1]),
-            env_ids)
-        self.group.net_articulation.set_joint_velocities(
-            torch.zeros(len(env_ids), self.init_net_joint.shape[-1], device=self.device),
-            env_ids)
+        # ---- Reset net nodes (1D view, build flat indices) ----
+        n_nodes = self.n_nodes
+        n_ids = (env_ids.unsqueeze(-1) * n_nodes
+                 + torch.arange(n_nodes, device=self.device)).reshape(-1)
+        net_pos = self.init_net_nodes_pos.reshape(self.num_envs, n_nodes, 3)[env_ids].reshape(-1, 3)
+        net_rot = self.init_net_nodes_rot.reshape(self.num_envs, n_nodes, 4)[env_ids].reshape(-1, 4)
+        self.group.net_nodes_view.set_world_poses(net_pos, net_rot, n_ids)
+
+        # ---- Reset net edge capsules ----
+        n_edges = self.init_net_edges_pos.shape[0] // self.num_envs
+        e_ids = (env_ids.unsqueeze(-1) * n_edges
+                 + torch.arange(n_edges, device=self.device)).reshape(-1)
+        edge_pos = self.init_net_edges_pos.reshape(self.num_envs, n_edges, 3)[env_ids].reshape(-1, 3)
+        edge_rot = self.init_net_edges_rot.reshape(self.num_envs, n_edges, 4)[env_ids].reshape(-1, 4)
+        self.group.net_edges_view.set_world_poses(edge_pos, edge_rot, e_ids)
+
+        # ---- Reset rope segments ----
+        n_segs = self.init_rope_segs_pos.shape[0] // self.num_envs
+        s_ids = (env_ids.unsqueeze(-1) * n_segs
+                 + torch.arange(n_segs, device=self.device)).reshape(-1)
+        seg_pos = self.init_rope_segs_pos.reshape(self.num_envs, n_segs, 3)[env_ids].reshape(-1, 3)
+        seg_rot = self.init_rope_segs_rot.reshape(self.num_envs, n_segs, 4)[env_ids].reshape(-1, 4)
+        self.group.rope_segs_view.set_world_poses(seg_pos, seg_rot, s_ids)
+
+        # ---- Zero net/rope velocities (GPU API) ----
+        self.group.net_nodes_view.set_velocities(
+            torch.zeros(len(env_ids) * n_nodes, 6, device=self.device), n_ids)
+        self.group.net_edges_view.set_velocities(
+            torch.zeros(len(env_ids) * n_edges, 6, device=self.device), e_ids)
+        self.group.rope_segs_view.set_velocities(
+            torch.zeros(len(env_ids) * n_segs, 6, device=self.device), s_ids)
 
         # Sample target heading — always upward (z > 0).
         # Uniform direction in the upper hemisphere with at least 30° upward tilt.
@@ -302,16 +329,21 @@ class NetCapture(IsaacEnv):
             axis[..., 2:3] * torch.sin(half_angle),             # z
         ], dim=-1)  # (n, 4)
 
-        # Set target visual marker poses
-        world_pos = target_pos + self.envs_positions[env_ids]
-        self.target.set_world_poses(positions=world_pos, env_indices=env_ids)
-        # Arrow: offset by half shaft length along heading so base is at target
-        arrow_world_pos = world_pos + heading_vec * 0.15
-        self.target_heading_view.set_world_poses(
-            positions=arrow_world_pos,
-            orientations=heading_quat,
-            env_indices=env_ids,
-        )
+        # Set target visual marker poses via USD API (NO RigidPrimView — avoids GPU conflict)
+        target_pos_world = target_pos + self.envs_positions[env_ids]
+        for idx, env_id in enumerate(env_ids.tolist()):
+            tp = target_pos_world[idx].tolist()
+            # set_prim_property takes a prim PATH string, not a Prim object
+            omni.isaac.core.utils.prims.set_prim_property(
+                self._target_prim_paths[env_id], "xformOp:translate", Gf.Vec3f(*tp))
+            # Position + orient heading arrow
+            ap = (target_pos_world[idx] + heading_vec[idx] * 0.15).tolist()
+            hq = heading_quat[idx].tolist()
+            omni.isaac.core.utils.prims.set_prim_property(
+                self._target_heading_prim_paths[env_id], "xformOp:translate", Gf.Vec3f(*ap))
+            omni.isaac.core.utils.prims.set_prim_property(
+                self._target_heading_prim_paths[env_id], "xformOp:orient",
+                Gf.Quatf(hq[0], hq[1], hq[2], hq[3]))
 
         self.stats[env_ids] = 0.
 
@@ -362,7 +394,7 @@ class NetCapture(IsaacEnv):
         )  # (num_envs, 3)
 
         # Target position in env frame
-        target_pos, _ = self.get_env_poses(self.target.get_world_poses())
+        target_pos = self.target_pos  # env-local, set by _reset_idx
 
         # Relative positions
         drone_pos = self.drone_states[..., :3]  # (num_envs, n, 3)
@@ -471,7 +503,7 @@ class NetCapture(IsaacEnv):
 
         r = r_sep · (w_cap·r_capture + w_head·r_phead + 0.3·r_stretch + w_up·r_up + r_eff + r_smooth)
         """
-        target_pos, _ = self.get_env_poses(self.target.get_world_poses())
+        target_pos = self.target_pos  # env-local, set by _reset_idx
         N, K = self.num_envs, self.drone.n
 
         # --- 1. XY alignment ---

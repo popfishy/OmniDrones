@@ -26,14 +26,16 @@ from typing import Sequence, Union
 import omni.isaac.core.utils.prims as prim_utils
 import torch
 
-from omni_drones.views import RigidPrimView, ArticulationView
-from pxr import UsdPhysics
+from omni_drones.views import RigidPrimView
+from pxr import UsdPhysics, PhysxSchema
 
 import omni_drones.utils.kit as kit_utils
 import omni_drones.utils.scene as scene_utils
 
 from omni_drones.robots import RobotBase, RobotCfg
 from omni_drones.robots.drone import MultirotorBase
+from omni.isaac.core.utils.stage import get_current_stage
+from omni.kit.commands import execute
 from dataclasses import dataclass
 
 
@@ -53,17 +55,58 @@ class NetCaptureCfg(RobotCfg):
             raise ValueError("num_drones must be 4 or 6.")
 
 
+def _strip_articulation(drone_prim_path: str):
+    """Remove articulation schemas and set excludeFromArticulation on all
+    joints under *drone_prim_path* so the drone behaves as standalone
+    RigidBodies (no implicit articulations).
+
+    Called after *drone.spawn()* to undo the ArticulationRootAPI baked into
+    the USD asset, preventing PhysX from creating implicit articulations that
+    legally require CPU-side APIs (PxRigidDynamic::setGlobalPose /
+    setLinearVelocity / setAngularVelocity) which are *illegal* with
+    eENABLE_DIRECT_GPU_API.
+    """
+    stage = get_current_stage()
+    drone_prim = stage.GetPrimAtPath(drone_prim_path)
+    if not drone_prim:
+        return
+
+    # 1. Remove ArticulationRootAPI
+    if drone_prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+        execute("UnapplyAPISchema", api=UsdPhysics.ArticulationRootAPI, prim=drone_prim)
+    if drone_prim.HasAPI(PhysxSchema.PhysxArticulationAPI):
+        execute("UnapplyAPISchema", api=PhysxSchema.PhysxArticulationAPI, prim=drone_prim)
+
+    # 2. Set excludeFromArticulation=True on ALL joints under the drone.
+    #    Without ArticulationRootAPI these joints would form implicit
+    #    articulations → same CPU-API-illegal problem.
+    for prim in stage.Traverse():
+        if not prim.GetPath().pathString.startswith(drone_prim_path):
+            continue
+        if prim.IsA(UsdPhysics.Joint) or prim.GetTypeName() == "PhysicsJoint":
+            prim.GetAttribute("physics:excludeFromArticulation").Set(True)
+
+
 class NetCaptureGroup(RobotBase):
     """
-    Spanning-tree articulation architecture:
+    Architecture:
 
-      drone_i  (ArticulationRoot):  base_link + rotors + rope segs
-        └── rope seg_11 ──Fixed(excl)── net/node_corner
+      drone_i  (standalone RigidBodies — ArticulationRootAPI removed,
+                 all joint excludeFromArticulation=True)
+        └── base_link + 4 rotors (FixedJoints → standalone constraints)
 
-      net      (ArticulationRoot):  36 nodes + 35 tree edges
-        + 25 loop-closing D6 joints (excludeFromArticulation=True)
+      rope_i   (standalone RigidBodies — all D6 joints have
+                 excludeFromArticulation=True)
+        └── compliant D6 (5e2 stiffness) → net corner node
+        └── compliant D6 (5e2 stiffness) → drone base_link
 
-    Reset uses ArticulationView.set_world_poses() — GPU compatible.
+      net      (standalone RigidBodies — 36 nodes + 60 edge capsules,
+                 all D6 joints have excludeFromArticulation=True)
+
+    ALL bodies are standalone RigidBodies — the drone's internal USD
+    ArticulationRootAPI is stripped at spawn time.  This means
+    RigidPrimView.set_world_poses (GPU API: _physics_view.set_transforms)
+    works on every body without triggering illegal CPU API calls.
     """
 
     def __init__(
@@ -76,9 +119,10 @@ class NetCaptureGroup(RobotBase):
         super().__init__(name, cfg, is_articulation)
         if isinstance(drone, str):
             drone = MultirotorBase.REGISTRY[drone]()
-        # Drone keeps its own ArticulationRoot — rope segments will be added
-        # as articulation links so the whole drone+rope tree resets together.
-        drone.is_articulation = True
+        # Drone bodies are standalone RigidBodies (ArticulationRootAPI stripped
+        # at spawn time).  RigidPrimView uses GPU API for set_world_poses /
+        # set_velocities — no CPU API calls.
+        drone.is_articulation = False
         self.drone = drone
         self.translations = []
 
@@ -112,7 +156,7 @@ class NetCaptureGroup(RobotBase):
                 raise RuntimeError(f"Duplicate prim at {prim_path}.")
             xform = prim_utils.create_prim(prim_path, translation=translation)
 
-            # ---- 1.  Net Articulation ----
+            # ---- 1.  Net ----
             net_info = scene_utils.create_net(
                 xform_path=f"{prim_path}/net",
                 rows=self.net_rows,
@@ -134,7 +178,7 @@ class NetCaptureGroup(RobotBase):
             z_drone = (self.rope_links - 1) * self.rope_link_length * 0.75
             drone_translations = self._compute_drone_positions(corner_indices, z_drone)
 
-            # ---- 3.  Drones (articulations) + ropes (independent) ----
+            # ---- 3.  Drones (standalone RigidBodies) + ropes ----
             for i in range(self.num_drones):
                 drone_path = f"/World/envs/env_0/{self.drone.name.lower()}_{i}"
                 self.drone.spawn(
@@ -142,14 +186,14 @@ class NetCaptureGroup(RobotBase):
                     prim_paths=[drone_path],
                 )
 
+                # Strip articulation schemas so ALL drone bodies are
+                # standalone RigidBodies — no CPU-API-illegal calls.
+                _strip_articulation(drone_path)
+
                 r, c = corner_indices[i]
                 corner_node_path = str(net_info["nodes"][r][c].GetPath())
                 drone_base_link = f"{drone_path}/base_link"
 
-                # Rope as independent RigidBodies under GROUP.
-                # Both FixedJoints use excludeFromArticulation=True:
-                # corner_node is in net articulation, drone is its own
-                # articulation, rope segments are independent RigidBodies.
                 rope_translation = drone_translations[i].tolist()
                 scene_utils.create_rope(
                     xform_path=f"{prim_path}/rope_{i}",
@@ -185,23 +229,29 @@ class NetCaptureGroup(RobotBase):
             prim_paths_expr = f"/World/envs/.*/{self.name}_.*"
         self.prim_paths_expr = prim_paths_expr
 
-        # Drone ArticulationView (includes rope segments as articulation links)
+        # Drones use RigidPrimView (GPU-compatible custom override).
+        # With ArticulationRootAPI stripped and all joints having
+        # excludeFromArticulation=True, no CPU API calls are triggered.
         self.drone.initialize(f"/World/envs/.*/{self.drone.name.lower()}_*")
 
-        # Net ArticulationView — for GPU-compatible reset
-        self.net_articulation = ArticulationView(
-            f"{self.prim_paths_expr}/net",
-            reset_xform_properties=False,
-            shape=(-1, 1),
-        )
-        self.net_articulation.initialize()
-
-        # RigidPrimView for reading net node positions (observation only, no set)
+        # Net + rope: standalone RigidPrimViews (GPU API).
         self.net_nodes_view = RigidPrimView(
             f"{self.prim_paths_expr}/net/node_*",
             reset_xform_properties=False,
         )
         self.net_nodes_view.initialize()
+
+        self.net_edges_view = RigidPrimView(
+            f"{self.prim_paths_expr}/net/edge_*/capsule",
+            reset_xform_properties=False,
+        )
+        self.net_edges_view.initialize()
+
+        self.rope_segs_view = RigidPrimView(
+            f"{self.prim_paths_expr}/rope_*/seg_*",
+            reset_xform_properties=False,
+        )
+        self.rope_segs_view.initialize()
 
     def apply_action(self, actions: torch.Tensor) -> torch.Tensor:
         return self.drone.apply_action(actions)
