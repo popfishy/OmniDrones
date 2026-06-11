@@ -498,6 +498,29 @@ class RigidPrimView(_RigidPrimView):
         with disable_warnings(self._physics_sim_view):
             return _RigidPrimView.set_velocities(self, velocities.reshape(-1, 6), indices)
 
+    def apply_forces_and_torques_at_pos(
+        self,
+        forces=None,
+        torques=None,
+        positions=None,
+        indices=None,
+        is_global: bool = True,
+    ) -> None:
+        """Override: handle _physics_view=None without warning spam.
+
+        When the timeline STOP event clears _physics_view, the base class
+        logs a warning and silently returns — forces are never applied.
+        We suppress the warning (it's noise during headless training) and
+        attempt the GPU path if the view is available.
+        """
+        if not omni.timeline.get_timeline_interface().is_stopped() and self._physics_view is not None:
+            return super().apply_forces_and_torques_at_pos(
+                forces=forces, torques=torques, positions=positions,
+                indices=indices, is_global=is_global,
+            )
+        # View unavailable — suppressed.  The GPU dynamics pipeline
+        # re-creates the view on the next sim.step() cycle.
+
     def get_net_contact_forces(
         self,
         env_indices: Optional[torch.Tensor] = None,
