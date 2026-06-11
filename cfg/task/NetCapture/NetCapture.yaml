@@ -19,16 +19,16 @@ num_drones: 4
 net_rows: 6
 net_cols: 6
 net_spacing: 0.25       # distance between adjacent nodes (m) — 5×5 → 1.0m wide
-rope_links: 12           # segments per rope (particles for PBD)
-rope_link_length: 0.1    # segment length (m) — total ~1.2m
+rope_links: 16           # segments per rope (particles for PBD)
+rope_link_length: 0.1    # segment length (m) — total ~1.6m
 
 # PBD particle rope (GPU-native, NO D6 joints, NO CPU API fallbacks)
 use_pbd_rope: true
 pbd_particle_mass: 0.01
-pbd_stretch_stiffness: 1.0e4
-pbd_bend_stiffness: 2.0e2
+pbd_stretch_stiffness: 1.0e6   # rope-like tension (not rubber band)
+pbd_bend_stiffness: 1.0        # soft/flexible (not stiff wire)
 pbd_spring_damping: 0.2
-pbd_solver_iterations: 16
+pbd_solver_iterations: 32      # needed for stiff stretch constraint convergence
 
 # Target parameters
 target_size: [0.3, 0.3, 0.3]  # (x, y, z) metres

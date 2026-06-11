@@ -45,7 +45,7 @@ class NetCaptureCfg(RobotCfg):
     net_rows: int = 6
     net_cols: int = 6
     net_spacing: float = 0.25
-    rope_links: int = 12
+    rope_links: int = 16          # more segments → smoother rope curvature
     rope_link_length: float = 0.1
     node_mass: float = 0.01
     corner_mass: float = 0.02
@@ -53,10 +53,10 @@ class NetCaptureCfg(RobotCfg):
     # PBD particle rope (GPU-native, NO D6 joints)
     use_pbd_rope: bool = True
     pbd_particle_mass: float = 0.01
-    pbd_stretch_stiffness: float = 1e4
-    pbd_bend_stiffness: float = 2e2
+    pbd_stretch_stiffness: float = 1e6   # high → rope-like (not rubber band)
+    pbd_bend_stiffness: float = 1.0      # low  → soft/flexible (not stiff wire)
     pbd_spring_damping: float = 0.2
-    pbd_solver_iterations: int = 16
+    pbd_solver_iterations: int = 32      # higher → stiff constraints converge
 
     def __post_init__(self):
         if self.num_drones not in (4, 6):
