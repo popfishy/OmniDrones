@@ -228,7 +228,9 @@ def create_pbd_rope(
     particle_mass: float = 0.01,
     stretch_stiffness: float = 1e4,
     bend_stiffness: float = 2e2,
+    shear_stiffness: float = 1e6,
     spring_damping: float = 0.2,
+    velocity_damping: float = 0.3,
     solver_position_iterations: int = 16,
 ) -> dict:
     """Create a PBD particle-based rope connecting two rigid bodies.
@@ -330,16 +332,17 @@ def create_pbd_rope(
             particle_system_enabled=True,
         )
 
-    # Particle material
+    # Particle material with velocity damping (air resistance)
     mat_path = Sdf.Path(particle_system_path + "_mat")
     if not stage.GetPrimAtPath(mat_path):
-        particleUtils.add_pbd_particle_material(stage, mat_path)
-        particleUtils.add_pbd_particle_material(stage, mat_path, friction=0.5)
+        particleUtils.add_pbd_particle_material(
+            stage, mat_path, damping=velocity_damping, friction=0.5
+        )
         physicsUtils.add_physics_material_to_prim(
             stage, stage.GetPrimAtPath(particle_system_path), mat_path
         )
 
-    # 4. Auto-spring cloth
+    # 4. Auto-spring cloth — lock shear to prevent 2-row ribbon twist
     particleUtils.add_physx_particle_cloth(
         stage=stage,
         path=mesh_path,
@@ -347,7 +350,7 @@ def create_pbd_rope(
         particle_system_path=particle_system_path,
         spring_stretch_stiffness=stretch_stiffness,
         spring_bend_stiffness=bend_stiffness,
-        spring_shear_stiffness=0.0,
+        spring_shear_stiffness=shear_stiffness,
         spring_damping=spring_damping,
         self_collision=False,
     )
