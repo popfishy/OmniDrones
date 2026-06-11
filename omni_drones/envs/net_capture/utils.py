@@ -214,10 +214,12 @@ class NetCaptureGroup(RobotBase):
                     # PBD particle rope — GPU native, no D6 joints
                     # Compute start/end positions so rope endpoints EXACTLY
                     # match drone base_link and net corner positions.
+                    # Positions are in Group_0-local coords (ropeMesh is a
+                    # child of Group_0 xform — no extra translate op).
                     # This ensures PhysxAutoAttachmentAPI can find the
-                    # closest particles (proximity search).
-                    start_pos = (translation + drone_offset).tolist()
-                    end_pos = (translation + torch.tensor([cx, cy, 0.], device=self.device)).tolist()
+                    # closest particles via proximity search.
+                    start_pos = drone_offset.tolist()     # (cx, cy, z_drone)
+                    end_pos = [cx, cy, 0.]                # net z=0 in group frame
                     ps_path = f"{prim_path}/particleSystem"
                     rope_info = scene_utils.create_pbd_rope(
                         xform_path=f"{prim_path}/rope_pbd_{i}",
