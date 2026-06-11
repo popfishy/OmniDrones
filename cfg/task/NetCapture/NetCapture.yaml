@@ -25,12 +25,12 @@ rope_link_length: 0.1    # segment length (m) — total ~1.6m
 # PBD particle rope (GPU-native, NO D6 joints, NO CPU API fallbacks)
 use_pbd_rope: true
 pbd_particle_mass: 0.01
-pbd_stretch_stiffness: 1.0e6   # rope-like tension
-pbd_bend_stiffness: 1.5        # natural draping
-pbd_shear_stiffness: 1.0e6     # lock 2-row strip → prevent ribbon twist
-pbd_spring_damping: 100.0      # constraint damping (scaled w/ 1e6 stiffness)
-pbd_velocity_damping: 0.3      # global air-resistance damping
-pbd_solver_iterations: 48      # stiff constraint convergence
+pbd_stretch_stiffness: 1.0e6   # rope-like tension (non-negotiable)
+pbd_bend_stiffness: 0.02       # ultra-soft at 48 iters → natural U-shape draping
+pbd_shear_stiffness: 5.0e3     # prevent ribbon twist, allow mild torsion
+pbd_spring_damping: 20.0       # balanced — not sticky, not jittery
+pbd_velocity_damping: 0.1      # light air resistance → natural sway
+pbd_solver_iterations: 48      # high iterations lock stretch only, not bend
 
 # Target parameters
 target_size: [0.3, 0.3, 0.3]  # (x, y, z) metres
