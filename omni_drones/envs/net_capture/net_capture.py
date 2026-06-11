@@ -126,7 +126,8 @@ class NetCapture(IsaacEnv):
         self.init_rotor_pos, self.init_rotor_rot = self.drone.rotors_view.get_world_poses(clone=True)
         self.init_net_nodes_pos, self.init_net_nodes_rot = self.group.net_nodes_view.get_world_poses(clone=True)
         self.init_net_edges_pos, self.init_net_edges_rot = self.group.net_edges_view.get_world_poses(clone=True)
-        self.init_rope_segs_pos, self.init_rope_segs_rot = self.group.rope_segs_view.get_world_poses(clone=True)
+        if not self.cfg.task.get("use_pbd_rope", True):
+            self.init_rope_segs_pos, self.init_rope_segs_rot = self.group.rope_segs_view.get_world_poses(clone=True)
 
         # Target above initial drone height (1.325), forcing upward scooping.
         # Net at 0.5, drones at ~1.325, target at 1.5–2.5.
@@ -287,21 +288,29 @@ class NetCapture(IsaacEnv):
         edge_rot = self.init_net_edges_rot.reshape(self.num_envs, n_edges, 4)[env_ids].reshape(-1, 4)
         self.group.net_edges_view.set_world_poses(edge_pos, edge_rot, e_ids)
 
-        # ---- Reset rope segments ----
-        n_segs = self.init_rope_segs_pos.shape[0] // self.num_envs
-        s_ids = (env_ids.unsqueeze(-1) * n_segs
-                 + torch.arange(n_segs, device=self.device)).reshape(-1)
-        seg_pos = self.init_rope_segs_pos.reshape(self.num_envs, n_segs, 3)[env_ids].reshape(-1, 3)
-        seg_rot = self.init_rope_segs_rot.reshape(self.num_envs, n_segs, 4)[env_ids].reshape(-1, 4)
-        self.group.rope_segs_view.set_world_poses(seg_pos, seg_rot, s_ids)
+        if self.cfg.task.get("use_pbd_rope", True):
+            # PBD rope: particles are attached to rigid bodies via
+            # PhysxPhysicsAttachment.  When rigid bodies are teleported
+            # (set_world_poses above), PhysX automatically repositions the
+            # attached particles.  No separate rope reset needed.
+            pass
+        else:
+            # ---- Reset D6 joint rope segments ----
+            n_segs = self.init_rope_segs_pos.shape[0] // self.num_envs
+            s_ids = (env_ids.unsqueeze(-1) * n_segs
+                     + torch.arange(n_segs, device=self.device)).reshape(-1)
+            seg_pos = self.init_rope_segs_pos.reshape(self.num_envs, n_segs, 3)[env_ids].reshape(-1, 3)
+            seg_rot = self.init_rope_segs_rot.reshape(self.num_envs, n_segs, 4)[env_ids].reshape(-1, 4)
+            self.group.rope_segs_view.set_world_poses(seg_pos, seg_rot, s_ids)
 
-        # ---- Zero net/rope velocities (GPU API) ----
+        # ---- Zero net velocities (GPU API) ----
         self.group.net_nodes_view.set_velocities(
             torch.zeros(len(env_ids) * n_nodes, 6, device=self.device), n_ids)
         self.group.net_edges_view.set_velocities(
             torch.zeros(len(env_ids) * n_edges, 6, device=self.device), e_ids)
-        self.group.rope_segs_view.set_velocities(
-            torch.zeros(len(env_ids) * n_segs, 6, device=self.device), s_ids)
+        if not self.cfg.task.get("use_pbd_rope", True):
+            self.group.rope_segs_view.set_velocities(
+                torch.zeros(len(env_ids) * n_segs, 6, device=self.device), s_ids)
 
         # Sample target heading — always upward (z > 0).
         # Uniform direction in the upper hemisphere with at least 30° upward tilt.

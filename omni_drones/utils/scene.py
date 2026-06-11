@@ -28,9 +28,12 @@ import omni.isaac.core.utils.stage as stage_utils
 import omni.physx.scripts.utils as script_utils
 import torch
 
-from pxr import Gf, PhysxSchema, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
 from scipy.spatial.transform import Rotation
 
+import omni.kit.commands
+import omni.usd
+from omni.physx.scripts import particleUtils, physicsUtils
 import omni_drones.utils.kit as kit_utils
 
 
@@ -212,6 +215,166 @@ def create_rope(
                                     (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
 
     return links
+
+
+def create_pbd_rope(
+    xform_path: str = "/World/rope",
+    translation=(0, 0, 0),
+    particle_system_path: str = "/World/particleSystem",
+    from_prim: Union[str, Usd.Prim] = None,
+    to_prim: Union[str, Usd.Prim] = None,
+    num_particles: int = 12,
+    rope_length: float = 1.2,
+    particle_mass: float = 0.01,
+    stretch_stiffness: float = 1e4,
+    bend_stiffness: float = 2e2,
+    spring_damping: float = 0.2,
+    solver_position_iterations: int = 16,
+) -> dict:
+    """Create a PBD particle-based rope connecting two rigid bodies.
+
+    Uses PhysX PBD particle cloth with auto-generated spring constraints
+    to simulate a flexible rope/cable.  Each rope is a narrow 2-row mesh
+    strip whose edges generate valid spring constraints via the
+    PhysxAutoParticleClothAPI.
+
+    GPU-native — NO D6 joints, NO CPU API fallbacks.
+
+    .. note::
+       ``sim.reset()`` MUST be called before initializing the ClothPrimView
+       for this rope.  The particle positions can only be read via
+       ``ClothPrimView.get_world_positions()`` — the USD mesh points
+       attribute is static.
+
+    Args:
+        xform_path: USD path for the rope mesh prim.
+        translation: world-space offset for the rope root.
+        particle_system_path: Path to the shared PhysxParticleSystem.
+        from_prim: Rigid body at the far end (e.g. net corner).
+        to_prim: Rigid body at the near end (e.g. drone base_link).
+        num_particles: Number of lengthwise particle rows.
+        rope_length: Total rest length of the rope (m).
+        particle_mass: Mass per particle row (kg).
+        stretch_stiffness: Spring stretch stiffness (force/distance).
+        bend_stiffness: Spring bend stiffness.
+        spring_damping: Damping on all spring constraints.
+        solver_position_iterations: PBD solver iterations.
+
+    Returns:
+        dict with ``mesh_path``, ``num_vertices``, ``attachments``.
+    """
+    stage = stage_utils.get_current_stage()
+    if isinstance(from_prim, str):
+        from_prim = prim_utils.get_prim_at_path(from_prim)
+    if isinstance(to_prim, str):
+        to_prim = prim_utils.get_prim_at_path(to_prim)
+    if isinstance(translation, torch.Tensor):
+        translation = translation.tolist()
+
+    W = 0.02   # strip width — narrow enough for rope-like behavior
+    N = num_particles
+
+    # 1. 2-row strip mesh: row 0 = top, row N..2N-1 = bottom
+    positions = [
+        Gf.Vec3f(i * rope_length / (N - 1), W / 2, 0.0)
+        for i in range(N)
+    ] + [
+        Gf.Vec3f(i * rope_length / (N - 1), -W / 2, 0.0)
+        for i in range(N)
+    ]
+    face_counts = []
+    face_indices = []
+    for k in range(N - 1):
+        a, b, c, d = k, k + 1, N + k, N + k + 1
+        face_counts.extend([3, 3])
+        face_indices.extend([a, c, b, a, d, c])
+
+    # 2. Xform → Mesh
+    xform = prim_utils.get_prim_at_path(xform_path)
+    if not xform:
+        xform = UsdGeom.Xform.Define(stage, xform_path)
+    mesh_path = f"{xform_path}/ropeMesh"
+    mesh = UsdGeom.Mesh.Define(stage, mesh_path)
+    mesh.CreatePointsAttr().Set(positions)
+    mesh.CreateFaceVertexCountsAttr().Set(face_counts)
+    mesh.CreateFaceVertexIndicesAttr().Set(face_indices)
+    mesh.AddTranslateOp().Set(Gf.Vec3f(*translation))
+    mesh.AddOrientOp().Set(Gf.Quatf(1.0))
+
+    # 3. Particle system (one per rope group — caller may share across ropes)
+    if not stage.GetPrimAtPath(particle_system_path):
+        particleUtils.add_physx_particle_system(
+            stage=stage,
+            particle_system_path=particle_system_path,
+            contact_offset=0.02,
+            rest_offset=0.01,
+            particle_contact_offset=0.03,
+            solid_rest_offset=0.01,
+            fluid_rest_offset=0.0,
+            solver_position_iterations=solver_position_iterations,
+            simulation_owner="/physicsScene",
+            particle_system_enabled=True,
+        )
+
+    # Particle material
+    mat_path = Sdf.Path(particle_system_path + "_mat")
+    if not stage.GetPrimAtPath(mat_path):
+        particleUtils.add_pbd_particle_material(stage, mat_path)
+        particleUtils.add_pbd_particle_material(stage, mat_path, friction=0.5)
+        physicsUtils.add_physics_material_to_prim(
+            stage, stage.GetPrimAtPath(particle_system_path), mat_path
+        )
+
+    # 4. Auto-spring cloth
+    particleUtils.add_physx_particle_cloth(
+        stage=stage,
+        path=mesh_path,
+        dynamic_mesh_path=None,
+        particle_system_path=particle_system_path,
+        spring_stretch_stiffness=stretch_stiffness,
+        spring_bend_stiffness=bend_stiffness,
+        spring_shear_stiffness=0.0,
+        spring_damping=spring_damping,
+        self_collision=False,
+    )
+
+    # 5. Mass
+    UsdPhysics.MassAPI.Apply(mesh.GetPrim()).GetMassAttr().Set(
+        particle_mass * N * 2
+    )
+
+    # 6. PhysicsAttachments
+    attachments = []
+    if to_prim is not None:
+        a_to = Sdf.Path(
+            omni.usd.get_stage_next_free_path(stage, f"{mesh_path}/attTo", True)
+        )
+        omni.kit.commands.execute(
+            "CreatePhysicsAttachment",
+            target_attachment_path=a_to,
+            actor0_path=Sdf.Path(mesh_path),
+            actor1_path=to_prim.GetPath(),
+        )
+        attachments.append(("to", str(a_to)))
+
+    if from_prim is not None:
+        a_from = Sdf.Path(
+            omni.usd.get_stage_next_free_path(stage, f"{mesh_path}/attFrom", True)
+        )
+        omni.kit.commands.execute(
+            "CreatePhysicsAttachment",
+            target_attachment_path=a_from,
+            actor0_path=Sdf.Path(mesh_path),
+            actor1_path=from_prim.GetPath(),
+        )
+        attachments.append(("from", str(a_from)))
+
+    return {
+        "mesh_path": mesh_path,
+        "num_vertices": N * 2,
+        "num_particles": N,
+        "attachments": attachments,
+    }
 
 
 def create_bar(

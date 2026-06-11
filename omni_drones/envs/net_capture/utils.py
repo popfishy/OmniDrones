@@ -50,6 +50,14 @@ class NetCaptureCfg(RobotCfg):
     node_mass: float = 0.01
     corner_mass: float = 0.02
 
+    # PBD particle rope (GPU-native, NO D6 joints)
+    use_pbd_rope: bool = True
+    pbd_particle_mass: float = 0.01
+    pbd_stretch_stiffness: float = 1e4
+    pbd_bend_stiffness: float = 2e2
+    pbd_spring_damping: float = 0.2
+    pbd_solver_iterations: int = 16
+
     def __post_init__(self):
         if self.num_drones not in (4, 6):
             raise ValueError("num_drones must be 4 or 6.")
@@ -125,6 +133,7 @@ class NetCaptureGroup(RobotBase):
         drone.is_articulation = False
         self.drone = drone
         self.translations = []
+        self._rope_infos = []  # PBD rope info dicts
 
         self.num_drones = cfg.num_drones
         self.net_rows = cfg.net_rows
@@ -195,17 +204,39 @@ class NetCaptureGroup(RobotBase):
                 drone_base_link = f"{drone_path}/base_link"
 
                 rope_translation = drone_translations[i].tolist()
-                scene_utils.create_rope(
-                    xform_path=f"{prim_path}/rope_{i}",
-                    translation=rope_translation,
-                    from_prim=corner_node_path,
-                    to_prim=drone_base_link,
-                    num_links=self.rope_links,
-                    link_length=self.rope_link_length,
-                    color=(0.4, 0.2, 0.1),
-                    enable_collision=False,
-                    exclude_from_articulation=True,
-                )
+
+                if self.cfg.use_pbd_rope:
+                    # PBD particle rope — GPU native, no D6 joints
+                    rope_length = self.rope_links * self.rope_link_length
+                    ps_path = f"{prim_path}/particleSystem"
+                    rope_info = scene_utils.create_pbd_rope(
+                        xform_path=f"{prim_path}/rope_pbd_{i}",
+                        translation=rope_translation,
+                        particle_system_path=ps_path,
+                        from_prim=corner_node_path,
+                        to_prim=drone_base_link,
+                        num_particles=self.rope_links,
+                        rope_length=rope_length,
+                        particle_mass=self.cfg.pbd_particle_mass,
+                        stretch_stiffness=self.cfg.pbd_stretch_stiffness,
+                        bend_stiffness=self.cfg.pbd_bend_stiffness,
+                        spring_damping=self.cfg.pbd_spring_damping,
+                        solver_position_iterations=self.cfg.pbd_solver_iterations,
+                    )
+                    self._rope_infos.append(rope_info)
+                else:
+                    # Legacy D6 joint rope
+                    scene_utils.create_rope(
+                        xform_path=f"{prim_path}/rope_{i}",
+                        translation=rope_translation,
+                        from_prim=corner_node_path,
+                        to_prim=drone_base_link,
+                        num_links=self.rope_links,
+                        link_length=self.rope_link_length,
+                        color=(0.4, 0.2, 0.1),
+                        enable_collision=False,
+                        exclude_from_articulation=True,
+                    )
 
             prims.append(xform)
 
@@ -247,11 +278,20 @@ class NetCaptureGroup(RobotBase):
         )
         self.net_edges_view.initialize()
 
-        self.rope_segs_view = RigidPrimView(
-            f"{self.prim_paths_expr}/rope_*/seg_*",
-            reset_xform_properties=False,
-        )
-        self.rope_segs_view.initialize()
+        if self.cfg.use_pbd_rope:
+            from omni.isaac.core.prims.soft.cloth_prim_view import ClothPrimView
+            self.rope_cloth_view = ClothPrimView(
+                f"{self.prim_paths_expr}/rope_pbd_*/ropeMesh",
+                particle_systems=f"{self.prim_paths_expr}/particleSystem",
+                name="rope_pbd_view",
+            )
+            self.rope_cloth_view.initialize()
+        else:
+            self.rope_segs_view = RigidPrimView(
+                f"{self.prim_paths_expr}/rope_*/seg_*",
+                reset_xform_properties=False,
+            )
+            self.rope_segs_view.initialize()
 
     def apply_action(self, actions: torch.Tensor) -> torch.Tensor:
         return self.drone.apply_action(actions)
