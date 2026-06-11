@@ -70,6 +70,14 @@ cfg = OmegaConf.create({
 print(f"Creating NetCapture scene ({args.envs} env(s))...")
 env = NetCapture(cfg, headless=not args.gui)
 
+# Save USD BEFORE physics settles (captures all prims including PBD cloth)
+_out_dir = _os.path.join(_proj_root, "scripts/outputs")
+_os.makedirs(_out_dir, exist_ok=True)
+usd_path = _os.path.join(_out_dir, "test_net_capture.usda")
+stage = omni.usd.get_context().get_stage()
+stage.Export(usd_path, False)  # False = USDA text format (readable by Isaac Sim GUI)
+print(f"\nUSD stage saved to: {usd_path}")
+
 # ---- Let physics settle ----
 print("Letting physics settle (100 steps)...")
 for i in range(100):
@@ -80,16 +88,8 @@ print(f"  Mode:      {'GUI' if args.gui else 'headless'}")
 print(f"  Envs:      {args.envs}")
 print(f"  Drone:     {cfg.task.drone_model.name}")
 print(f"  Net:       {cfg.task.net_rows}×{cfg.task.net_cols}, spacing={cfg.task.net_spacing}m")
-print(f"  Ropes:     {cfg.task.rope_links} links × {cfg.task.rope_link_length}m")
+print(f"  Ropes:     {cfg.task.rope_links} {'PBD particles' if cfg.task.get('use_pbd_rope', True) else 'D6 joints'} × {cfg.task.rope_link_length}m")
 print(f"  Nodes:     {cfg.task.net_rows * cfg.task.net_cols} (edges: {cfg.task.net_rows*(cfg.task.net_cols-1) + (cfg.task.net_rows-1)*cfg.task.net_cols})")
-
-# ---- Save USD stage for later inspection ----
-_out_dir = _os.path.join(_proj_root, "scripts/outputs")
-_os.makedirs(_out_dir, exist_ok=True)
-usd_path = _os.path.join(_out_dir, "test_net_capture.usd")
-stage = omni.usd.get_context().get_stage()
-stage.Export(usd_path)
-print(f"\nUSD stage saved to: {usd_path}")
 print(f"To inspect interactively, open Isaac Sim and load this file.")
 
 if args.gui:

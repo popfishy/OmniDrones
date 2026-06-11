@@ -343,30 +343,37 @@ def create_pbd_rope(
         particle_mass * N * 2
     )
 
-    # 6. PhysicsAttachments
+    # 6. PhysicsAttachments with explicit vertex indices.
+    #    PhysxAutoAttachmentAPI (CreatePhysicsAttachment default) auto-selects
+    #    vertices by proximity, which can claim ALL cloth vertices for the first
+    #    attachment, leaving none for the second.  We pin only the endpoint
+    #    vertices explicitly.
+    #    Rope mesh layout:
+    #      top row:    vertices 0 … N-1
+    #      bottom row: vertices N … 2N-1
+    #    "to"   (first column):  indices 0, N    → to_prim (drone)
+    #    "from" (last column):   indices N-1, 2N-1 → from_prim (net corner)
     attachments = []
     if to_prim is not None:
         a_to = Sdf.Path(
             omni.usd.get_stage_next_free_path(stage, f"{mesh_path}/attTo", True)
         )
-        omni.kit.commands.execute(
-            "CreatePhysicsAttachment",
-            target_attachment_path=a_to,
-            actor0_path=Sdf.Path(mesh_path),
-            actor1_path=to_prim.GetPath(),
-        )
+        to_attach = PhysxSchema.PhysxPhysicsAttachment.Define(stage, a_to)
+        to_attach.GetActor0Rel().SetTargets([Sdf.Path(mesh_path)])
+        to_attach.GetActor1Rel().SetTargets([to_prim.GetPath()])
+        to_attach.GetFilterType0Attr().Set("Vertices")
+        to_attach.GetCollisionFilterIndices0Attr().Set([0, N])
         attachments.append(("to", str(a_to)))
 
     if from_prim is not None:
         a_from = Sdf.Path(
             omni.usd.get_stage_next_free_path(stage, f"{mesh_path}/attFrom", True)
         )
-        omni.kit.commands.execute(
-            "CreatePhysicsAttachment",
-            target_attachment_path=a_from,
-            actor0_path=Sdf.Path(mesh_path),
-            actor1_path=from_prim.GetPath(),
-        )
+        from_attach = PhysxSchema.PhysxPhysicsAttachment.Define(stage, a_from)
+        from_attach.GetActor0Rel().SetTargets([Sdf.Path(mesh_path)])
+        from_attach.GetActor1Rel().SetTargets([from_prim.GetPath()])
+        from_attach.GetFilterType0Attr().Set("Vertices")
+        from_attach.GetCollisionFilterIndices0Attr().Set([N - 1, 2 * N - 1])
         attachments.append(("from", str(a_from)))
 
     return {
