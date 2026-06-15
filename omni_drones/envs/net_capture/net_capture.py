@@ -21,7 +21,7 @@
 # SOFTWARE.
 
 
-import omni.usd
+import omni
 import torch
 import torch.distributions as D
 from torch.func import vmap
@@ -41,8 +41,6 @@ from omni_drones.utils.torch import (
     cpos,
     off_diag,
     others,
-    quat_axis,
-    euler_to_quaternion,
 )
 from omni_drones.robots.drone import MultirotorBase
 
@@ -51,54 +49,54 @@ from .utils import NetCaptureGroup, NetCaptureCfg
 
 class NetCapture(IsaacEnv):
     r"""
-    A cooperative control task where a group of UAVs carry a flexible net
-    connected via ropes. The goal for the agents is to collaboratively
-    control the net to descend and capture a static target object on the ground.
+    A cooperative hover control task where a group of UAVs carry a flexible net
+    connected via PBD particle ropes. The goal for the agents is to collaboratively
+    control the net so that its centre hovers at a fixed target point in 3D space.
+
+    Analogous to ``DragonHover`` but for a multi-drone tethered-net system.
 
     ## Observation
 
     The observation space contains the following items:
 
     - ``obs_self`` (1, \*): The state of each UAV observed by itself, containing
-      its kinematic information with position relative to the net centre.
+      its kinematic information with net-centre-relative position.
       It also includes a one-hot vector indicating each drone's identity.
     - ``obs_others`` (k-1, \*): The observed states of other agents.
     - ``obs_net`` (1, \*): Net centre + 4 corner positions relative to the drone.
-    - ``obs_target`` (1, \*): Target position relative to the drone.
+    - ``obs_target`` (1, 3): Target hover position relative to the drone.
 
     ## Reward
 
-    - ``reward_coverage``: Reward for the net covering the target in the XY plane.
-    - ``reward_descend``: Reward for the net descending to the target's height.
-    - ``reward_capture``: Bonus when the net drapes over the target.
-    - ``reward_up``: Reward for keeping drones upright.
-    - ``reward_effort``: Penalty for energy consumption.
+    .. math::
+
+        r = r_{pos} + r_{pos} \cdot w_{up} \cdot r_{up} + r_{eff} + r_{smooth}
+
+    - ``r_pos``: :math:`\exp(-\beta \cdot \|p_{net} - p_{tgt}\|)` — net centre distance.
+    - ``r_up``: :math:`mean((u_z + 1)/2)^2` — drone uprightness.
+    - ``r_eff``: Energy penalty.
+    - ``r_smooth``: Action smoothness penalty.
 
     ## Config
 
-    | Parameter           | Type  | Default       | Description                          |
-    | ------------------- | ----- | ------------- | ------------------------------------ |
-    | ``drone_model``     | str   | "hummingbird" |                                      |
-    | ``num_drones``      | int   | 4             |                                      |
-    | ``net_rows``        | int   | 3             | Number of node rows in the net.      |
-    | ``net_cols``        | int   | 3             | Number of node columns in the net.   |
-    | ``net_spacing``     | float | 0.5           | Distance between adjacent net nodes. |
-    | ``rope_links``      | int   | 12            | Number of segments per rope.         |
-    | ``target_size``     | list  | [0.3,0.3,0.3] | Target cube dimensions.              |
-    | ``reset_thres``     | float | 2.0           | Net deviation that triggers reset.   |
-    | ``capture_thres``   | float | 0.3           | XY distance to count as covering.    |
-    | ``safe_distance``   | float | 0.5           | Min separation before penalty.       |
+    | Parameter           | Type  | Default       | Description                         |
+    | ------------------- | ----- | ------------- | ----------------------------------- |
+    | ``drone_model``     | str   | "hummingbird" |                                     |
+    | ``num_drones``      | int   | 4             |                                     |
+    | ``net_rows``        | int   | 6             | Number of node rows in the net.     |
+    | ``net_cols``        | int   | 6             | Number of node columns in the net.  |
+    | ``net_spacing``     | float | 0.25          | Distance between adjacent nodes.    |
+    | ``rope_links``      | int   | 16            | Number of particles per PBD rope.   |
+    | ``reset_thres``     | float | 4.0           | Net drift that triggers reset.      |
+    | ``action_scale``    | float | 1.0           | Scale applied to RL actions.        |
     """
 
     def __init__(self, cfg, headless):
-        self.reward_coverage_weight = cfg.task.reward_coverage_weight
-        self.reward_descend_weight = cfg.task.reward_descend_weight
         self.reward_up_weight = cfg.task.reward_up_weight
         self.reward_effort_weight = cfg.task.reward_effort_weight
         self.reward_action_smoothness_weight = cfg.task.reward_action_smoothness_weight
         self.reward_distance_scale = cfg.task.reward_distance_scale
         self.reset_thres = cfg.task.reset_thres
-        self.safe_distance = cfg.task.safe_distance
         self.action_scale = cfg.task.get("action_scale", 1.0)
 
         # Must be set before super().__init__() because _set_specs() uses them
@@ -111,32 +109,29 @@ class NetCapture(IsaacEnv):
 
         self.group.initialize()
 
-        # Target is a pure visual prim (no RigidBody) — track position via tensor
-        # to avoid GPU API conflicts.  Position set via USD API in _reset_idx.
+        # Visual-only target marker (pure USD prim, NO RigidBody)
         self._target_prim_paths = [
             f"/World/envs/env_{i}/target" for i in range(self.num_envs)
-        ]
-        self._target_heading_prim_paths = [
-            f"/World/envs/env_{i}/target_heading" for i in range(self.num_envs)
         ]
 
         # Cache initial poses for GPU-compatible reset via RigidPrimView
         self.init_drone_pos, self.init_drone_rot = self.drone.get_world_poses(clone=True)
-        # Also cache rotor poses (reset with RigidPrimView alongside base_link)
         self.init_rotor_pos, self.init_rotor_rot = self.drone.rotors_view.get_world_poses(clone=True)
         self.init_net_nodes_pos, self.init_net_nodes_rot = self.group.net_nodes_view.get_world_poses(clone=True)
         self.init_net_edges_pos, self.init_net_edges_rot = self.group.net_edges_view.get_world_poses(clone=True)
         if not self.cfg.task.get("use_pbd_rope", True):
             self.init_rope_segs_pos, self.init_rope_segs_rot = self.group.rope_segs_view.get_world_poses(clone=True)
 
-        # Target above initial drone height (1.325), forcing upward scooping.
-        # Net at 0.5, drones at ~1.325, target at 1.5–2.5.
-        self.target_pos_dist = D.Uniform(
-            torch.tensor([-1.0, -1.0, 1.5], device=self.device),
-            torch.tensor([1.0, 1.0, 2.5], device=self.device),
+        # Fixed target hover point (net centre target, env-local coordinates)
+        target_pos_cfg = cfg.task.get("target_pos", [0.0, 0.0, 2.0])
+        self.target_pos = torch.tensor(target_pos_cfg, device=self.device).repeat(self.num_envs, 1)
+
+        # Random initial position offset (env-local, ±range from spawn point)
+        init_offset_cfg = cfg.task.get("init_drone_offset", [1.0, 1.0, 0.5])
+        self.init_pos_dist = D.Uniform(
+            torch.tensor(init_offset_cfg, device=self.device) * -1,
+            torch.tensor(init_offset_cfg, device=self.device),
         )
-        self.target_pos = torch.zeros(self.num_envs, 3, device=self.device)
-        self.target_heading_vec = torch.zeros(self.num_envs, 3, device=self.device)
         self.alpha = 0.8
 
     def _design_scene(self):
@@ -145,26 +140,37 @@ class NetCapture(IsaacEnv):
             drone_model_cfg.name, drone_model_cfg.controller
         )
 
+        use_pbd = self.cfg.task.get("use_pbd_rope", True)
         group_cfg = NetCaptureCfg(
             num_drones=self.cfg.task.num_drones,
             net_rows=self.cfg.task.net_rows,
             net_cols=self.cfg.task.net_cols,
             net_spacing=self.cfg.task.net_spacing,
             rope_links=self.cfg.task.rope_links,
+            use_pbd_rope=use_pbd,
+            rope_link_length=self.cfg.task.get("rope_link_length", 0.1),
         )
+        if use_pbd:
+            for key in (
+                "pbd_particle_mass", "pbd_stretch_stiffness", "pbd_bend_stiffness",
+                "pbd_shear_stiffness", "pbd_spring_damping", "pbd_velocity_damping",
+                "pbd_solver_iterations",
+            ):
+                if key in self.cfg.task:
+                    setattr(group_cfg, key, self.cfg.task[key])
 
         self.group = NetCaptureGroup(drone=self.drone, cfg=group_cfg)
 
         scene_utils.design_scene()
 
         self.group.spawn(translations=[(0, 0, 0.5)], enable_collision=True)
-        # Net at env z = 0.5, drones at 0.5 + 0.825 = 1.325
-        # Target above drones at z ∈ [1.5, 2.5]
+        # Net at env z = 0.5, drones at 0.5 + 1.125 = 1.625
+        # Target at z = 2.0 (fixed hover point for net centre)
 
         # Visual-only target marker (pure USD prim, NO RigidBody — avoids GPU API errors)
-        # Position updated via USD API in _reset_idx; read from self.target_pos tensor.
+        # Position updated via USD API in _reset_idx.
         import omni.isaac.core.utils.prims as prim_utils
-        from pxr import UsdGeom, Gf
+        from pxr import UsdGeom
 
         target_path = "/World/envs/env_0/target"
         target = prim_utils.create_prim(
@@ -175,19 +181,6 @@ class NetCapture(IsaacEnv):
         )
         UsdGeom.Imageable(target).MakeVisible()
 
-        # Heading direction arrow: long capsule along X, rotated to heading in XY plane.
-        arrow_path = "/World/envs/env_0/target_heading"
-        arrow = UsdGeom.Capsule.Define(
-            omni.usd.get_context().get_stage(),
-            arrow_path,
-        )
-        arrow.CreateAxisAttr("X")       # capsule along X (in XY plane)
-        arrow.CreateHeightAttr(0.3)     # shaft length 0.3m
-        arrow.CreateRadiusAttr(0.015)   # thin shaft
-        arrow.AddTranslateOp().Set(Gf.Vec3f(0, 0, 2.0))
-        arrow.AddOrientOp().Set(Gf.Quatf(1.0))  # create xformOp:orient so we can set it later
-        UsdGeom.Imageable(arrow.GetPrim()).MakeVisible()
-
         return ["/World/defaultGroundPlane"]
 
     def _set_specs(self):
@@ -195,8 +188,8 @@ class NetCapture(IsaacEnv):
 
         # Net observation per drone: net centre (6D) + 4 corners (4×6D) = 30D
         net_obs_dim = (1 + 4) * 6
-        # Target observation per drone: position (3D) + heading vector (3D)
-        target_obs_dim = 6
+        # Target observation per drone: relative position only (3D)
+        target_obs_dim = 3
 
         observation_spec = CompositeSpec({
             "obs_self": UnboundedContinuousTensorSpec((1, drone_state_dim)),
@@ -209,7 +202,7 @@ class NetCapture(IsaacEnv):
         observation_central_spec = CompositeSpec({
             "state_drones": UnboundedContinuousTensorSpec((self.drone.n, drone_state_dim)),
             "state_net": UnboundedContinuousTensorSpec((self.n_nodes, 6)),
-            "state_target": UnboundedContinuousTensorSpec((1, 6)),
+            "state_target": UnboundedContinuousTensorSpec((1, 3)),
         }).to(self.device)
 
         self.observation_spec = CompositeSpec({
@@ -240,7 +233,6 @@ class NetCapture(IsaacEnv):
             "return": UnboundedContinuousTensorSpec(self.drone.n),
             "episode_len": UnboundedContinuousTensorSpec(1),
             "net_target_dist": UnboundedContinuousTensorSpec(1),
-            "net_height": UnboundedContinuousTensorSpec(1),
             "uprightness": UnboundedContinuousTensorSpec(1),
             "action_smoothness": UnboundedContinuousTensorSpec(self.drone.n),
         }).expand(self.num_envs).to(self.device)
@@ -248,21 +240,25 @@ class NetCapture(IsaacEnv):
         self.stats = stats_spec.zero()
 
     def _reset_idx(self, env_ids: torch.Tensor):
-        # Sample target
-        target_pos = self.target_pos_dist.sample(env_ids.shape)
-        self.target_pos[env_ids] = target_pos
+        # Fixed target hover point (no per-episode sampling)
+        target_pos = self.target_pos[env_ids]
 
         n = self.drone.n
         self.drone._reset_idx(env_ids)
 
+        # Sample random initial position offset (env-local)
+        offset = self.init_pos_dist.sample((len(env_ids),))  # (len(env_ids), 3)
+
         # ---- Reset drone bodies (base_link + rotors) atomically ----
-        # Set both base_link and rotor poses back-to-back to avoid a constraint
-        # inconsistency window that would trigger CPU-side PhysX API calls.
-        d_pos = self.init_drone_pos.reshape(self.num_envs, n, 3)[env_ids].reshape(-1, 3)
+        # Apply same random offset to the entire drone+net system to avoid
+        # constraint inconsistency between FixedJoint-connected bodies.
+        d_pos_init = self.init_drone_pos.reshape(self.num_envs, n, 3)[env_ids]  # (len, n, 3)
+        d_pos = (d_pos_init + offset.unsqueeze(1)).reshape(-1, 3)
         d_rot = self.init_drone_rot.reshape(self.num_envs, n, 4)[env_ids].reshape(-1, 4)
         self.drone.set_world_poses(d_pos, d_rot, env_ids)
 
-        rot_pos = self.init_rotor_pos.reshape(self.num_envs, n, self.drone.num_rotors, 3)[env_ids]
+        rot_pos_init = self.init_rotor_pos.reshape(self.num_envs, n, self.drone.num_rotors, 3)[env_ids]
+        rot_pos = (rot_pos_init + offset.unsqueeze(1).unsqueeze(2)).reshape(-1, 3)
         rot_rot = self.init_rotor_rot.reshape(self.num_envs, n, self.drone.num_rotors, 4)[env_ids]
         self.drone.rotors_view.set_world_poses(rot_pos, rot_rot, env_ids)
 
@@ -272,11 +268,12 @@ class NetCapture(IsaacEnv):
         self.drone.rotors_view.set_velocities(
             torch.zeros(len(env_ids) * n * self.drone.num_rotors, 6, device=self.device), env_ids)
 
-        # ---- Reset net nodes (1D view, build flat indices) ----
+        # ---- Reset net nodes (offset to match drones) ----
         n_nodes = self.n_nodes
         n_ids = (env_ids.unsqueeze(-1) * n_nodes
                  + torch.arange(n_nodes, device=self.device)).reshape(-1)
-        net_pos = self.init_net_nodes_pos.reshape(self.num_envs, n_nodes, 3)[env_ids].reshape(-1, 3)
+        net_pos_init = self.init_net_nodes_pos.reshape(self.num_envs, n_nodes, 3)[env_ids]
+        net_pos = (net_pos_init + offset.unsqueeze(1)).reshape(-1, 3)
         net_rot = self.init_net_nodes_rot.reshape(self.num_envs, n_nodes, 4)[env_ids].reshape(-1, 4)
         self.group.net_nodes_view.set_world_poses(net_pos, net_rot, n_ids)
 
@@ -284,7 +281,8 @@ class NetCapture(IsaacEnv):
         n_edges = self.init_net_edges_pos.shape[0] // self.num_envs
         e_ids = (env_ids.unsqueeze(-1) * n_edges
                  + torch.arange(n_edges, device=self.device)).reshape(-1)
-        edge_pos = self.init_net_edges_pos.reshape(self.num_envs, n_edges, 3)[env_ids].reshape(-1, 3)
+        edge_pos_init = self.init_net_edges_pos.reshape(self.num_envs, n_edges, 3)[env_ids]
+        edge_pos = (edge_pos_init + offset.unsqueeze(1)).reshape(-1, 3)
         edge_rot = self.init_net_edges_rot.reshape(self.num_envs, n_edges, 4)[env_ids].reshape(-1, 4)
         self.group.net_edges_view.set_world_poses(edge_pos, edge_rot, e_ids)
 
@@ -299,7 +297,8 @@ class NetCapture(IsaacEnv):
             n_segs = self.init_rope_segs_pos.shape[0] // self.num_envs
             s_ids = (env_ids.unsqueeze(-1) * n_segs
                      + torch.arange(n_segs, device=self.device)).reshape(-1)
-            seg_pos = self.init_rope_segs_pos.reshape(self.num_envs, n_segs, 3)[env_ids].reshape(-1, 3)
+            seg_pos_init = self.init_rope_segs_pos.reshape(self.num_envs, n_segs, 3)[env_ids]
+            seg_pos = (seg_pos_init + offset.unsqueeze(1)).reshape(-1, 3)
             seg_rot = self.init_rope_segs_rot.reshape(self.num_envs, n_segs, 4)[env_ids].reshape(-1, 4)
             self.group.rope_segs_view.set_world_poses(seg_pos, seg_rot, s_ids)
 
@@ -312,47 +311,12 @@ class NetCapture(IsaacEnv):
             self.group.rope_segs_view.set_velocities(
                 torch.zeros(len(env_ids) * n_segs, 6, device=self.device), s_ids)
 
-        # Sample target heading — always upward (z > 0).
-        # Uniform direction in the upper hemisphere with at least 30° upward tilt.
-        theta = torch.rand(env_ids.shape, device=self.device) * (torch.pi / 3)  # [0, 60°] from vertical
-        phi = torch.rand(env_ids.shape, device=self.device) * (2 * torch.pi)     # [0, 360°] azimuth
-        heading_vec = torch.stack([
-            torch.sin(theta) * torch.cos(phi),
-            torch.sin(theta) * torch.sin(phi),
-            torch.cos(theta),                          # cos(θ) > 0 → upward
-        ], dim=-1)  # (n, 3), unit vector, z ≥ 0.5
-        self.target_heading_vec[env_ids] = heading_vec
-
-        # Quaternion for arrow indicator: rotate from +Z to heading_vec.
-        # Axis = cross(+Z, heading), angle = acos(dot(+Z, heading))
-        z_axis = torch.tensor([0., 0., 1.], device=self.device)
-        axis = torch.cross(z_axis.expand_as(heading_vec), heading_vec, dim=-1)
-        axis_norm = axis.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        axis = axis / axis_norm
-        angle = torch.acos(heading_vec[..., 2:3].clamp(-1, 1))  # acos(z·heading)
-        half_angle = angle / 2
-        heading_quat = torch.cat([
-            torch.cos(half_angle),                              # w
-            axis[..., 0:1] * torch.sin(half_angle),             # x
-            axis[..., 1:2] * torch.sin(half_angle),             # y
-            axis[..., 2:3] * torch.sin(half_angle),             # z
-        ], dim=-1)  # (n, 4)
-
-        # Set target visual marker poses via USD API (NO RigidPrimView — avoids GPU conflict)
+        # Set target visual marker (fixed position, just copy to prim)
         target_pos_world = target_pos + self.envs_positions[env_ids]
         for idx, env_id in enumerate(env_ids.tolist()):
             tp = target_pos_world[idx].tolist()
-            # set_prim_property takes a prim PATH string, not a Prim object
             omni.isaac.core.utils.prims.set_prim_property(
                 self._target_prim_paths[env_id], "xformOp:translate", Gf.Vec3f(*tp))
-            # Position + orient heading arrow
-            ap = (target_pos_world[idx] + heading_vec[idx] * 0.15).tolist()
-            hq = heading_quat[idx].tolist()
-            omni.isaac.core.utils.prims.set_prim_property(
-                self._target_heading_prim_paths[env_id], "xformOp:translate", Gf.Vec3f(*ap))
-            omni.isaac.core.utils.prims.set_prim_property(
-                self._target_heading_prim_paths[env_id], "xformOp:orient",
-                Gf.Quatf(hq[0], hq[1], hq[2], hq[3]))
 
         self.stats[env_ids] = 0.
 
@@ -449,11 +413,8 @@ class NetCapture(IsaacEnv):
             net_obs_self, corner_obs_self,
         ], dim=-1).unsqueeze(2)  # (num_envs, n, 1, net_obs_dim)
 
-        # Target: position (3) + heading vector (3) relative to each drone
-        heading_rpos = self.target_heading_vec.unsqueeze(1).expand(-1, self.drone.n, -1)
-        obs["obs_target"] = torch.cat([
-            target_rpos, heading_rpos,
-        ], dim=-1).unsqueeze(2)  # (num_envs, n, 1, 6)
+        # Target: relative position only (3D)
+        obs["obs_target"] = target_rpos.unsqueeze(2)  # (num_envs, n, 1, 3)
 
         # ---- Assemble centralized critic observation ----
         state = TensorDict({}, self.num_envs)
@@ -462,9 +423,7 @@ class NetCapture(IsaacEnv):
             net_pos.reshape(self.num_envs, -1, 3),
             net_vel[..., :3].reshape(self.num_envs, -1, 3),
         ], dim=-1)  # (num_envs, n_nodes, 6)
-        state["state_target"] = torch.cat([
-            target_pos, self.target_heading_vec,
-        ], dim=-1).unsqueeze(1)  # (num_envs, 1, 6)
+        state["state_target"] = target_pos.unsqueeze(1)  # (num_envs, 1, 3)
 
         # ---- Stats ----
         self.net_target_dist = torch.norm(
@@ -472,7 +431,6 @@ class NetCapture(IsaacEnv):
         )
 
         self.stats["net_target_dist"].lerp_(self.net_target_dist, (1 - self.alpha))
-        self.stats["net_height"].lerp_(self.net_centre[..., 2:3], (1 - self.alpha))
         self.stats["uprightness"].lerp_(
             self.drone.up[..., 2].mean(-1, keepdim=True), (1 - self.alpha)
         )
@@ -490,93 +448,48 @@ class NetCapture(IsaacEnv):
         )
 
     def _compute_reward_and_done(self):
+        r"""
+        DragonHover-style reward for multi-drone net hover control.
+
+        .. math::
+
+            r = r_{pos} + r_{pos} \cdot w_{up} \cdot r_{up} + r_{eff} + r_{smooth}
+
+        - r_pos  = exp(-β · ‖p_net - p_tgt‖)   net centre distance
+        - r_up   = mean((u_z + 1)/2)²          drone uprightness
+        - r_eff  = -w_eff · mean(throttle)      energy penalty
+        - r_smooth = -w_smooth · mean(Δthrottle) action smoothness
         """
-        "Scooping" reward — fly net beneath target, lift from below.
-
-        Let:
-          p_net, p_tgt ∈ ℝ³ : net centre & target position
-          dist_xy = ‖p_net[...,:2] - p_tgt[...,:2]‖   (XY plane)
-          z_diff  = p_tgt_z - p_net_z                    (+ when net below target)
-
-        1. r_xy      = exp(-2·dist_xy)                   XY alignment under target
-        2. r_z       = exp(-2·z_diff)    if z_diff > 0   climb toward target
-                       exp( 1·z_diff)    if z_diff ≤ 0   stable above target
-        3. r_capture = r_xy · r_z                        full scoop: aligned + lifted
-        4. r_stretch = exp(-2·|diag_ideal - diag_actual|) prevent net collapse
-        5. r_head    = ((n_net·v_tgt + 1)/2)²            heading alignment
-        6. r_phead   = r_capture · r_head                coupled
-        7. r_up      = mean((u_i_z + 1)/2)²              drone upright
-        8. r_eff     = -w_eff · mean(throttle)           energy
-        9. r_smooth  = -w_smooth · mean(Δthrottle)       smoothness
-       10. r_sep     = (min_dist/d_safe)²                anti-collision factor
-
-        r = r_sep · (w_cap·r_capture + w_head·r_phead + 0.3·r_stretch + w_up·r_up + r_eff + r_smooth)
-        """
-        target_pos = self.target_pos  # env-local, set by _reset_idx
+        target_pos = self.target_pos  # env-local, fixed
         N, K = self.num_envs, self.drone.n
 
-        # --- 1. XY alignment ---
-        dist_xy = torch.norm(self.net_centre[..., :2] - target_pos[..., :2], dim=-1, keepdim=True)
-        self.net_target_dist = torch.norm(self.net_centre - target_pos, dim=-1, keepdim=True)
-        r_xy = torch.exp(-dist_xy * 2.0)
-
-        # --- 2. Upward scooper ---
-        z_diff = target_pos[..., 2:3] - self.net_centre[..., 2:3]
-        r_z = torch.where(
-            z_diff > 0,
-            torch.exp(-z_diff * 2.0),   # net below: encourage climbing up
-            torch.exp(z_diff * 1.0),     # net above: gentle decay, stay close
+        # Net centre distance to target
+        self.net_target_dist = torch.norm(
+            self.net_centre - target_pos, dim=-1, keepdim=True
         )
-        r_capture = r_xy * r_z
+        r_pos = torch.exp(-self.net_target_dist * self.reward_distance_scale)
 
-        # --- 3. Anti-collapse stretch ---
-        # 6×6 net, spacing=0.25 → edge length = (6-1)*0.25 = 1.25
-        # ideal diagonal = sqrt(1.25² + 1.25²) ≈ 1.7678
-        diag_ideal = (self.net_rows - 1) * self.net_spacing * (2 ** 0.5)
-        diag1 = torch.norm(self.corner_pos[:, 0] - self.corner_pos[:, 3], dim=-1, keepdim=True)
-        diag2 = torch.norm(self.corner_pos[:, 1] - self.corner_pos[:, 2], dim=-1, keepdim=True)
-        r_stretch = torch.exp(-torch.abs(diag1 - diag_ideal) * 2.0) * \
-                    torch.exp(-torch.abs(diag2 - diag_ideal) * 2.0)
-
-        # --- 4. Dynamic scooping: attitude + velocity alignment ---
-        # 4a. Static attitude: net normal aligned with target heading
-        attitude_align = (self.net_normal * self.target_heading_vec).sum(dim=-1, keepdim=True)
-        r_attitude = torch.square((attitude_align + 1) / 2)
-
-        # 4b. Dynamic velocity: net centre velocity direction aligned with target heading
-        net_speed = torch.norm(self.net_centre_vel, dim=-1, keepdim=True).clamp(min=1e-5)
-        net_vel_dir = self.net_centre_vel / net_speed
-        vel_align = (net_vel_dir * self.target_heading_vec).sum(dim=-1, keepdim=True)
-        r_vel_dir = torch.square((vel_align + 1) / 2)
-        r_speed_scale = (net_speed / 1.0).clamp(0, 1)   # max score at ≥1 m/s
-
-        # Combined: must be near target, face right, and MOVE in target direction
-        r_scoop = r_capture * r_attitude * (0.5 + 0.5 * r_vel_dir * r_speed_scale)
-
-        # --- 5. Auxiliary terms ---
+        # Uprightness: mean of drone body z-axis alignment with world Z
         r_up = torch.square((self.drone.up[..., 2] + 1) / 2).mean(-1, keepdim=True)
+
+        # Energy penalty
         r_eff = -self.reward_effort_weight * self.effort.mean(-1, keepdim=True)
+
+        # Action smoothness
         r_smooth = -self.reward_action_smoothness_weight * \
             self.drone.throttle_difference.mean(-1, keepdim=True)
-        sep = self.drone_pdist.min(dim=-2).values.min(dim=-2).values
-        r_sep = torch.square((sep / self.safe_distance).clamp(0, 1))
 
-        # --- Total ---
-        r_total = (
-            self.reward_coverage_weight * r_scoop
-            + 0.3 * r_stretch
-            + self.reward_up_weight * r_up
-            + r_eff
-            + r_smooth
-        ) * r_sep
+        # Total: pose reward multiplicatively gates uprightness bonus
+        r_total = r_pos + r_pos * self.reward_up_weight * r_up + r_eff + r_smooth
 
         reward = torch.zeros(N, K, 1, device=self.device)
         reward[:] = r_total.reshape(N, 1, 1)
 
         # --- Termination ---
         misbehave = (
-            (self.drone_states[..., 2] > 5.0).any(-1, keepdim=True)   # runaway
-            | (self.net_target_dist > self.reset_thres)
+            (self.drone_states[..., 2] < 0.2).any(-1, keepdim=True)    # crash
+            | (self.drone_states[..., 2] > 5.0).any(-1, keepdim=True)   # runaway
+            | (self.net_target_dist > self.reset_thres)                  # net drifts too far
         )
         hasnan = torch.isnan(self.drone_states).any(-1)
         terminated = misbehave | hasnan.any(-1, keepdim=True)
