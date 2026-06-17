@@ -237,9 +237,15 @@ class Decoder(nn.Module):
                     )
                     self.mlp.append(actor)
         else:
-            self.action_encoder = nn.Sequential(
-                init_ortho(nn.Linear(action_dim, n_embd), activate=True), nn.GELU()
-            )
+            if action_type == "Discrete":
+                self.action_encoder = nn.Sequential(
+                    init_ortho(nn.Linear(action_dim + 1, n_embd, bias=False), activate=True),
+                    nn.GELU(),
+                )
+            else:
+                self.action_encoder = nn.Sequential(
+                    init_ortho(nn.Linear(action_dim, n_embd), activate=True), nn.GELU()
+                )
             self.obs_encoder = nn.Sequential(
                 nn.LayerNorm(obs_dim),
                 init_ortho(nn.Linear(obs_dim, n_embd), activate=True),
@@ -273,6 +279,11 @@ class Decoder(nn.Module):
                 x = block(x, obs_rep)
             logit = self.head(x)
         return logit
+
+    def zero_std(self, device):
+        if self.action_type != "Discrete":
+            log_std = torch.zeros(self.action_dim).to(device)
+            self.log_std.data = log_std
 
 
 class MATPolicy(object):
@@ -449,9 +460,10 @@ class MATPolicy(object):
         return tensordict
 
     def continuous_parallel_act(self, batch, deterministic=False):
+        encoder_input = batch.select(*self.encoder_in_keys, strict=False)
+        obs_rep = self.encoder(encoder_input)["obs_rep"]
         obs = batch[self.obs_name]
         action = batch[self.act_name]
-        obs_rep = batch["obs_rep"]
 
         batch_size = obs.shape[0]
         shifted_action = torch.zeros(

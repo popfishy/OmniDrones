@@ -113,6 +113,12 @@ class Population:
     def set_latest_policy(self):
         self._set_policy(self._module_idx)
 
+    def set_second_latest_policy(self):
+        self._set_policy(self._module_idx - 1)
+
+    def set_behavioural_strategy(self, index: int):
+        self._set_policy(index)
+
     def sample(self, meta_policy: np.array):
         if len(meta_policy) == len(self.policy_sets):
             self._set_policy(np.random.choice(len(self.policy_sets), p=meta_policy))
@@ -125,6 +131,14 @@ class Population:
     def __call__(self, tensordict: TensorDict) -> TensorDict:
         tensordict = tensordict.to(self.device)
         return self._func(tensordict)
+
+    def _get_policy_checkpoint(self, index: int) -> dict:
+        if not isinstance(self.policy_sets[index], int):
+            raise ValueError("The policy params are not saved in the population")
+        return torch.load(os.path.join(self.dir, f"{self.policy_sets[index]}.pt"))
+
+    def get_latest_policy_checkpoint(self) -> dict:
+        return self._get_policy_checkpoint(self._module_idx)
 
 
 class Shared_Actor_Population(Population):

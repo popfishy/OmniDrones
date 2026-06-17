@@ -400,14 +400,22 @@ class MAPPOPolicy(object):
         state_dict = {
             "critic": self.critic.state_dict(),
             "actor_params": self.actor_params,
+            "actor_opt": self.actor_opt.state_dict(),
+            "critic_opt": self.critic_opt.state_dict(),
             "value_normalizer": self.value_normalizer.state_dict()
         }
         return state_dict
 
     def load_state_dict(self, state_dict):
-        self.actor_params = TensorDictParams(state_dict["actor_params"])
+        self.actor_params = state_dict["actor_params"]
+        if not isinstance(self.actor_params, TensorDictParams):
+            self.actor_params = TensorDictParams(self.actor_params)
         self.actor_opt = torch.optim.Adam(self.actor_params.parameters(), lr=self.cfg.actor.lr)
+        if "actor_opt" in state_dict:
+            self.actor_opt.load_state_dict(state_dict["actor_opt"])
         self.critic.load_state_dict(state_dict["critic"])
+        if "critic_opt" in state_dict:
+            self.critic_opt.load_state_dict(state_dict["critic_opt"])
         self.value_normalizer.load_state_dict(state_dict["value_normalizer"])
 
     def eval(self):

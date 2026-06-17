@@ -149,3 +149,16 @@ class MAPPOPolicyMask(MAPPOPolicy):
             "critic_grad_norm": grad_norm.item(),
             "explained_var": explained_var.item()
         }
+
+    def state_dict(self):
+        state_dict = super().state_dict()
+        state_dict["actor_opt"] = self.actor_opt.state_dict()
+        state_dict["critic_opt"] = self.critic_opt.state_dict()
+        return state_dict
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        if "actor_opt" in state_dict:
+            self.actor_opt.load_state_dict(state_dict["actor_opt"])
+        if "critic_opt" in state_dict:
+            self.critic_opt.load_state_dict(state_dict["critic_opt"])

@@ -137,12 +137,12 @@ class TD3Policy(object):
 
             transition = self.replay_buffer.sample(self.batch_size)
 
-            state   = transition[("agents", "observation")]
-            action_taken = transition[("agents", "action")]
+            state   = transition[self.obs_name]
+            action_taken = transition[self.act_name]
 
-            reward  = transition[("next", "agents", "reward")]
+            reward  = transition[("next", self.reward_name)]
             next_dones  = transition[("next", "done")].float().unsqueeze(-1)
-            next_state  = transition[("next", "agents", "observation")]
+            next_state  = transition[("next", self.obs_name)]
 
             with torch.no_grad():
 
@@ -239,7 +239,7 @@ class Critic(nn.Module):
             action_dim = self.act_space.shape[-1]
             state_dim = self.state_space.shape[-1]
             num_units = [
-                action_dim * self.num_agents + state_dim,
+                action_dim * self.num_agents + state_dim * self.num_agents,
                 *self.cfg["hidden_units"]
             ]
             base = MLP(num_units)
