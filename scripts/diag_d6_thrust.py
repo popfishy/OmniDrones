@@ -24,7 +24,7 @@ Action range: [-1.0, 1.0]
     Any float in [-1, 1] is valid.
 
 Output:
-    results_video/diag_d6_thrust/
+    scripts/results_video/diag_d6_thrust/
         action_{val}.mp4
         action_{val}_data.npz
 """
@@ -37,7 +37,7 @@ import argparse, os, sys, glob, numpy as np, torch
 # ── Path setup ────────────────────────────────────────────────────────────
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.dirname(_script_dir)
-_output_dir = os.path.join(_project_root, "results_video", "diag_d6_thrust")
+_output_dir = os.path.join(_script_dir, "results_video", "diag_d6_thrust")
 os.makedirs(_output_dir, exist_ok=True)
 
 DEFAULT_ACTIONS = [-0.14, 0.0, 0.5, 1.0, -1.0]   # hover → rise → crash
