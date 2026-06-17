@@ -125,8 +125,19 @@ class NetCapture(IsaacEnv):
         )
         self.target_heading_view.initialize()
 
-        # Cache initial drone velocities for reset
-        self.init_drone_vels = torch.zeros_like(self.drone.get_velocities())
+        # Cache initial poses for GPU-compatible reset
+        self.init_drone_pos, self.init_drone_rot = self.drone.get_world_poses(clone=True)
+        self.init_rotor_pos, self.init_rotor_rot = self.drone.rotors_view.get_world_poses(clone=True)
+        self.init_net_nodes_pos, self.init_net_nodes_rot = self.group.net_nodes_view.get_world_poses(clone=True)
+        self.init_net_edges_pos, self.init_net_edges_rot = self.group.net_edges_view.get_world_poses(clone=True)
+        self.init_rope_segs_pos, self.init_rope_segs_rot = self.group.rope_segs_view.get_world_poses(clone=True)
+
+        # Random initial position offset for episode variety
+        init_offset_cfg = cfg.task.get("init_drone_offset", [1.0, 1.0, 0.5])
+        self.init_pos_dist = D.Uniform(
+            torch.tensor(init_offset_cfg, device=self.device) * -1,
+            torch.tensor(init_offset_cfg, device=self.device),
+        )
 
         # Target: 3D point ABOVE initial drone height so drones must fly upward.
         # Drone z ≈ 3.825 in env frame (3.0 group + 0.825 above net).
@@ -252,14 +263,63 @@ class NetCapture(IsaacEnv):
         target_pos = self.target_pos_dist.sample(env_ids.shape)
         self.target_pos[env_ids] = target_pos
 
-        # Reset drone internal state (throttles, randomization)
+        n = self.drone.n
         self.drone._reset_idx(env_ids)
 
-        # Zero drone velocities
+        # ---- Teleport ALL bodies to initial positions + random offset ----
+        offset = self.init_pos_dist.sample((len(env_ids),))  # (len, 3)
+        num_rotors = self.drone.num_rotors
+
+        # Drone base_links
+        d_pos_init = self.init_drone_pos.reshape(self.num_envs, n, 3)[env_ids]
+        d_pos = (d_pos_init + offset.unsqueeze(1)).reshape(-1, 3)
+        d_rot = self.init_drone_rot.reshape(self.num_envs, n, 4)[env_ids].reshape(-1, 4)
+        self.drone.set_world_poses(d_pos, d_rot, env_ids)
+
+        # Rotors (must be set together with base_links to avoid constraint issues)
+        rot_pos_init = self.init_rotor_pos.reshape(self.num_envs, n, num_rotors, 3)[env_ids]
+        rot_pos = (rot_pos_init + offset.unsqueeze(1).unsqueeze(2)).reshape(-1, 3)
+        rot_rot = self.init_rotor_rot.reshape(self.num_envs, n, num_rotors, 4)[env_ids]
+        self.drone.rotors_view.set_world_poses(rot_pos, rot_rot, env_ids)
+
+        # Net nodes
+        n_nodes = self.n_nodes
+        n_ids = (env_ids.unsqueeze(-1) * n_nodes
+                 + torch.arange(n_nodes, device=self.device)).reshape(-1)
+        net_pos_init = self.init_net_nodes_pos.reshape(self.num_envs, n_nodes, 3)[env_ids]
+        net_pos = (net_pos_init + offset.unsqueeze(1)).reshape(-1, 3)
+        net_rot = self.init_net_nodes_rot.reshape(self.num_envs, n_nodes, 4)[env_ids].reshape(-1, 4)
+        self.group.net_nodes_view.set_world_poses(net_pos, net_rot, n_ids)
+
+        # Net edge capsules
+        n_edges = self.init_net_edges_pos.shape[0] // self.num_envs
+        e_ids = (env_ids.unsqueeze(-1) * n_edges
+                 + torch.arange(n_edges, device=self.device)).reshape(-1)
+        edge_pos_init = self.init_net_edges_pos.reshape(self.num_envs, n_edges, 3)[env_ids]
+        edge_pos = (edge_pos_init + offset.unsqueeze(1)).reshape(-1, 3)
+        edge_rot = self.init_net_edges_rot.reshape(self.num_envs, n_edges, 4)[env_ids].reshape(-1, 4)
+        self.group.net_edges_view.set_world_poses(edge_pos, edge_rot, e_ids)
+
+        # Rope segments
+        n_segs = self.init_rope_segs_pos.shape[0] // self.num_envs
+        s_ids = (env_ids.unsqueeze(-1) * n_segs
+                 + torch.arange(n_segs, device=self.device)).reshape(-1)
+        seg_pos_init = self.init_rope_segs_pos.reshape(self.num_envs, n_segs, 3)[env_ids]
+        seg_pos = (seg_pos_init + offset.unsqueeze(1)).reshape(-1, 3)
+        seg_rot = self.init_rope_segs_rot.reshape(self.num_envs, n_segs, 4)[env_ids].reshape(-1, 4)
+        self.group.rope_segs_view.set_world_poses(seg_pos, seg_rot, s_ids)
+
+        # ---- Zero ALL velocities ----
         self.drone.set_velocities(
-            torch.zeros(len(env_ids) * self.drone.n, 6, device=self.device),
-            env_indices=env_ids,
-        )
+            torch.zeros(len(env_ids) * n, 6, device=self.device), env_ids)
+        self.drone.rotors_view.set_velocities(
+            torch.zeros(len(env_ids) * n * num_rotors, 6, device=self.device), env_ids)
+        self.group.net_nodes_view.set_velocities(
+            torch.zeros(len(env_ids) * n_nodes, 6, device=self.device), n_ids)
+        self.group.net_edges_view.set_velocities(
+            torch.zeros(len(env_ids) * n_edges, 6, device=self.device), e_ids)
+        self.group.rope_segs_view.set_velocities(
+            torch.zeros(len(env_ids) * n_segs, 6, device=self.device), s_ids)
 
         # Sample target heading — always upward (z > 0).
         # Uniform direction in the upper hemisphere with at least 30° upward tilt.

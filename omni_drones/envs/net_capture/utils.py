@@ -212,6 +212,20 @@ class NetCaptureGroup(RobotBase):
         )
         self.net_nodes_view.initialize()
 
+        # RigidPrimView for net edge capsules
+        self.net_edges_view = RigidPrimView(
+            f"{self.prim_paths_expr}/net/edge_*/capsule",
+            reset_xform_properties=False,
+        )
+        self.net_edges_view.initialize()
+
+        # RigidPrimView for D6 rope segments
+        self.rope_segs_view = RigidPrimView(
+            f"{self.prim_paths_expr}/rope_*/seg_*",
+            reset_xform_properties=False,
+        )
+        self.rope_segs_view.initialize()
+
     def apply_action(self, actions: torch.Tensor) -> torch.Tensor:
         return self.drone.apply_action(actions)
 
