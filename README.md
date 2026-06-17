@@ -113,7 +113,7 @@ Hydra `defaults` 组合配置，命令行可覆盖任意键。
 
 | 算法 key | 类 | Critic | 适用 |
 |----------|-----|--------|------|
-| `mappo` | `MAPPO` (`mappo_new.py`) | **集中式** (`observation_central`) | 多机共享奖励 |
+| `mappo` | `MAPPO` (`ppo/mappo.py`) | **集中式** (`observation_central`) | 多机共享奖励 |
 | `ppo` | `PPOPolicy` (`ppo/ppo.py`) | 去中心化 (局部观测) | 单机任务 |
 | `happo` | `HAPPOPolicy` | 可选集中式 | 异构多智能体 |
 
@@ -151,7 +151,7 @@ DifferentialUAV 推力灵敏度是 Hummingbird 的 2.34 倍，直接训练易导
 | 环境基类 | `omni_drones/envs/isaac_env.py` |
 | 无人机基类 | `omni_drones/robots/drone/multirotor.py` |
 | 推力计算 | `omni_drones/actuators/rotor_group.py` |
-| MAPPO (集中式 Critic) | `omni_drones/learning/mappo_new.py` |
+| MAPPO (集中式 Critic) | `omni_drones/learning/ppo/mappo.py` |
 | PPO (去中心化 Critic) | `omni_drones/learning/ppo/ppo.py` |
 | 训练入口 | `scripts/train.py` |
 | 场景工具（rope/net/bar） | `omni_drones/utils/scene.py` |

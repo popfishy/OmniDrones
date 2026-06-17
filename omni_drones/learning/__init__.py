@@ -22,7 +22,7 @@
 
 
 from .mappo import MAPPOPolicy
-from .mappo_new import MAPPO
+from .ppo.mappo import MAPPO
 from .ppo import *
 from .happo import HAPPOPolicy
 from .qmix import QMIXPolicy
