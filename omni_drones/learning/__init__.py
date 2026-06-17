@@ -32,6 +32,10 @@ from .sac import SACPolicy
 from .td3 import TD3Policy
 from .matd3 import MATD3Policy
 from .tdmpc import TDMPCPolicy
+from .maddpg import MADDPGPolicy
+from .mappo_mask import MAPPOPolicyMask
+from .mat import MATPolicy
+from .psro import PSROPolicy
 
 ALGOS = {
     "mappo_old": MAPPOPolicy,
@@ -42,4 +46,8 @@ ALGOS = {
     "ppo_adapt": PPOAdaptivePolicy,
     "sac": SACPolicy,
     "td3": TD3Policy,
+    "maddpg": MADDPGPolicy,
+    "mappo_mask": MAPPOPolicyMask,
+    "mat": MATPolicy,
+    "psro": PSROPolicy,
 }

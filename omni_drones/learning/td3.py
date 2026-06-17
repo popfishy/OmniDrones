@@ -98,7 +98,7 @@ class TD3Policy(object):
 
         self.critic = Critic(
             self.cfg.critic,
-            1,
+            self.agent_spec.n,
             self.agent_spec.observation_spec,
             self.agent_spec.action_spec
         ).to(self.device)

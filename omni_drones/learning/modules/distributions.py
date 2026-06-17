@@ -24,7 +24,7 @@
 import functools
 import math
 from numbers import Number
-from typing import List, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributions as D
@@ -61,6 +61,37 @@ _mappings = {
     "relu": torch.relu,
     "expln": expln,
 }
+
+
+class CustomDiagGaussian(nn.Module):
+    def __init__(
+        self,
+        num_inputs,
+        num_outputs,
+        use_orthogonal=False,
+        gain=0.01,
+        create_dist_func: Optional[
+            Callable[[torch.Tensor, torch.Tensor], D.Distribution]
+        ] = None,
+    ):
+        super(CustomDiagGaussian, self).__init__()
+
+        init_method = [nn.init.xavier_uniform_, nn.init.orthogonal_][use_orthogonal]
+
+        def init_(m):
+            return init(m, init_method, lambda x: nn.init.constant_(x, 0), gain)
+
+        self.fc_mean = init_(nn.Linear(num_inputs, num_outputs))
+        self.log_std = nn.Parameter(torch.zeros(num_outputs))
+        self.create_dist_func = create_dist_func or (
+            lambda loc, scale: D.Independent(D.Normal(loc, scale), 1)
+        )
+
+    def forward(self, x):
+        action_mean = self.fc_mean(x)
+        action_std = torch.broadcast_to(torch.exp(self.log_std), action_mean.shape)
+        dist = self.create_dist_func(action_mean, action_std)
+        return dist
 
 
 class DiagGaussian(nn.Module):

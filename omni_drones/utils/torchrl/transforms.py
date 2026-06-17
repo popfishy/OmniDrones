@@ -22,9 +22,13 @@
 
 
 from typing import Any, Dict, Optional, Sequence, Union, Tuple
+from collections import defaultdict
+from collections.abc import Callable
 
 import torch
+import numpy as np
 from tensordict.tensordict import TensorDictBase, TensorDict
+from tensordict.utils import NestedKey
 from torchrl.data.tensor_specs import TensorSpec
 from torchrl.envs.common import EnvBase
 from torchrl.envs.transforms import (
@@ -335,3 +339,171 @@ class History(Transform):
                 item_history[_reset] = 0.
         return tensordict
 
+
+import logging
+import os
+
+import h5py
+
+
+def append_to_h5(filename, data_dict: Dict[str, Optional[np.ndarray]]):
+    with h5py.File(filename, "a") as file:
+        for dataset_name, new_data in data_dict.items():
+            if new_data is None:
+                continue
+            if dataset_name not in file:
+                dataset = file.create_dataset(
+                    dataset_name, data=new_data, maxshape=(None, new_data.shape[-1])
+                )
+            else:
+                dataset = file[dataset_name]
+                current_shape = dataset.shape
+                new_shape = (current_shape[0] + new_data.shape[0], current_shape[1])
+                dataset.resize(new_shape)
+                dataset[current_shape[0] : new_shape[0], :] = new_data
+
+
+class _Buffer:
+    def __init__(self, size=1024 * 128) -> None:
+        self._size = size
+        self._cnt = 0
+        self._buf = []
+
+    def update(self, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if arr is None:
+            return
+
+        self._cnt += len(arr)
+        self._buf.append(arr)
+
+        if self._cnt >= self._size:
+            tmp: np.ndarray = np.concatenate(self._buf, axis=0)
+            self._buf.clear()
+            self._cnt = 0
+            return tmp
+
+
+class LogOnEpisode(Transform):
+    def __init__(
+        self,
+        n_episodes: int,
+        in_keys: Sequence[str] = None,
+        log_keys: Sequence[str] = None,
+        logger_func: Callable = None,
+        process_func: Dict[str, Callable] = None,
+    ):
+        super().__init__(in_keys=in_keys)
+        if not len(in_keys) == len(log_keys):
+            raise ValueError
+        self.in_keys = in_keys
+        self.log_keys = log_keys
+
+        self.n_episodes = n_episodes
+        self.logger_func = logger_func
+
+        self.process_func = defaultdict(
+            lambda: lambda x: torch.nanmean(x.float()).item()
+        )
+        if process_func is not None:
+            self.process_func.update(process_func)
+
+        self.stats = []
+        self._frames = 0
+
+    def _call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        return tensordict
+
+    def _step(self, tensordict: TensorDictBase, next_tensordict) -> TensorDictBase:
+        _reset = next_tensordict.get("done", None)
+        if _reset is None:
+            _reset = torch.zeros(
+                tensordict.batch_size, dtype=torch.bool, device=tensordict.device
+            )
+        if _reset.any():
+            _reset = _reset.all(-1).cpu()
+            rst_tensordict = next_tensordict.select(*self.in_keys).cpu()
+            self.stats.extend(rst_tensordict[_reset].unbind(0))
+            if len(self.stats) >= self.n_episodes:
+                stats: TensorDictBase = torch.stack(self.stats)
+                dict_to_log = {}
+                for in_key, log_key in zip(self.in_keys, self.log_keys):
+                    try:
+                        process_func = self.process_func[log_key]
+                        if isinstance(log_key, tuple):
+                            log_key = ".".join(log_key)
+                        dict_to_log[log_key] = process_func(stats[in_key])
+                    except:
+                        pass
+
+                if self.training:
+                    dict_to_log = {
+                        f"train/{k}": v for k, v in dict_to_log.items() if v is not None
+                    }
+                else:
+                    dict_to_log = {
+                        f"eval/{k}": v for k, v in dict_to_log.items() if v is not None
+                    }
+
+                if self.logger_func is not None:
+                    dict_to_log["env_frames"] = self._frames
+                    self.logger_func(dict_to_log)
+                self.stats.clear()
+
+        if self.training:
+            self._frames += tensordict.numel()
+        return next_tensordict
+
+
+class ActionTracker(Transform):
+    def __init__(
+        self,
+        action_key: NestedKey = ("agents", "action"),
+        dist_loc_key: NestedKey = ("debug", "action_loc"),
+        dist_scale_key: NestedKey = ("debug", "action_scale"),
+        maximum_length: int = 1024 * 512,
+        filename: str = "action_info.h5",
+    ):
+        super().__init__(in_keys=[action_key, dist_loc_key, dist_scale_key])
+        self.maximum_length = maximum_length
+        self._cnt = 0
+
+        self.action_buffer = _Buffer()
+        self.loc_buffer = _Buffer()
+        self.scale_buffer = _Buffer()
+
+        self.filename = filename
+
+        if os.path.exists(self.filename):
+            logging.warning(
+                f"{self.filename} already exists. New data will be appended."
+            )
+
+    def _call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        return tensordict
+
+    def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
+        if self._cnt >= self.maximum_length:
+            return tensordict
+        action: torch.Tensor = tensordict.get(self.in_keys[0]).cpu()
+        action = action.flatten(start_dim=0, end_dim=1).numpy()
+        self._cnt += len(action)
+
+        loc: Optional[torch.Tensor] = tensordict.get(self.in_keys[1], None)
+        if loc is not None:
+            loc: torch.Tensor = loc.cpu()
+            loc = loc.flatten(start_dim=0, end_dim=1).numpy()
+
+        scale: Optional[torch.Tensor] = tensordict.get(self.in_keys[2], None)
+        if scale is not None:
+            scale: torch.Tensor = scale.cpu()
+            scale = scale.flatten(start_dim=0, end_dim=1).numpy()
+        append_to_h5(
+            self.filename,
+            {
+                "action": self.action_buffer.update(action),
+                "loc": self.loc_buffer.update(loc),
+                "scale": self.scale_buffer.update(scale),
+            },
+        )
+
+        return tensordict

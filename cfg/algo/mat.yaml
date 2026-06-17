@@ -1,0 +1,34 @@
+# @package _global_
+algo:
+  name: mat
+
+  # PPO parameters
+  train_every: 64
+  ppo_epochs: 5
+  num_minibatches: 4
+  normalize_advantages: true
+  clip_param: 0.2
+  gamma: 0.99
+  gae_lambda: 0.95
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 10.0
+  _use_clipped_value_loss: true
+  use_huber_loss: false
+
+  # MAT-specific transformer architecture
+  n_block: 3
+  n_embd: 256
+  n_head: 8
+  encode_state: false
+  dec_actor: false
+  share_actor: false
+
+  lr: 0.0005
+  weight_decay: 0.0
+
+  # Value normalization
+  value_norm:
+    class: ValueNorm1
+    kwargs:
+      beta: 0.995

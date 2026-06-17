@@ -17,5 +17,6 @@ setup(
         "moviepy",
         "av",
         "torchrl==0.3.1", # for torch==2.2.2
+        "h5py",
     ],
 )

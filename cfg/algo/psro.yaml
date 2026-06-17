@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - mappo
+
+algo:
+  name: psro
+
+  # PSRO-specific parameters (in addition to standard MAPPO params)
+  psro_epochs: 10
+  psro_iterations: 100
+  meta_solver: nash             # "nash" or "uniform"
+  population_dir: ./psro_population

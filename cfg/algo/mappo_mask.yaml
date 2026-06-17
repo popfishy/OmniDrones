@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - mappo
+
+algo:
+  name: mappo_mask
+
+# Set mask_name to a tensor key in the environment's observation/info spec
+# that provides per-agent action masks (e.g., ("agents", "action_mask")).
+# mask_name: ("agents", "action_mask")

@@ -67,7 +67,7 @@ class SACPolicy(object):
         self.make_critic()
 
         self.action_dim = self.agent_spec.action_spec.shape[-1]
-        self.target_entropy = - torch.tensor(self.action_dim, device=self.device)
+        self.target_entropy = - 0.5 * torch.tensor(self.action_dim, device=self.device)
         init_entropy = 1.0
         self.log_alpha = nn.Parameter(torch.tensor(init_entropy, device=self.device).log())
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=self.cfg.alpha_lr)
@@ -182,15 +182,20 @@ class SACPolicy(object):
                     self.actor_opt.step()
 
                     self.alpha_opt.zero_grad()
-                    alpha_loss = -(self.log_alpha * (logp + self.target_entropy).detach()).mean()
+                    logp_det = torch.clamp(logp.detach(), -20, 2)
+                    alpha_loss = -(self.log_alpha * (logp_det + self.target_entropy)).mean()
                     alpha_loss.backward()
+                    log_alpha_grad_norm = nn.utils.clip_grad_norm_([self.log_alpha], self.cfg.max_grad_norm)
                     self.alpha_opt.step()
+                    self.log_alpha.data.clamp_(min=-10, max=10)
 
                     infos_actor.append(TensorDict({
                         "actor_loss": actor_loss,
                         "actor_grad_norm": actor_grad_norm,
                         "entropy": -logp.mean(),
                         "alpha": self.log_alpha.exp().detach(),
+                        "log_alpha_grad_norm": log_alpha_grad_norm,
+                        "clamped_log_alpha": self.log_alpha.detach(),
                         "alpha_loss": alpha_loss,
                     }, []))
 
@@ -239,6 +244,7 @@ class Actor(nn.Module):
         else:
             act = act_dist.rsample()
         log_prob = act_dist.log_prob(act).unsqueeze(-1)
+        log_prob = torch.clamp(log_prob, min=-20.0, max=2.0)
 
         return act, log_prob
 
